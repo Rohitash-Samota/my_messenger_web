@@ -5,6 +5,15 @@ import { useState } from "react";
 
 import { login, register } from "@/lib/api";
 
+function authErrorMessage(error, mode) {
+  if (error?.status === 401) return "The email or password is incorrect.";
+  if (error?.status === 409) return "An account with this email already exists. Sign in instead.";
+  if (error?.status === 400) return "Please check the details you entered and try again.";
+  return error?.message || (mode === "login"
+    ? "We couldn’t sign you in. Please try again."
+    : "We couldn’t create your account. Please try again.");
+}
+
 export default function AuthScreen({ onAuthenticated }) {
   const [mode, setMode] = useState("login");
   const [showPassword, setShowPassword] = useState(false);
@@ -22,7 +31,7 @@ export default function AuthScreen({ onAuthenticated }) {
       const session = mode === "login" ? await login(form) : await register(form);
       onAuthenticated(session);
     } catch (requestError) {
-      setError(requestError.message || "We couldn’t sign you in. Please try again.");
+      setError(authErrorMessage(requestError, mode));
     } finally {
       setSubmitting(false);
     }
@@ -52,10 +61,10 @@ export default function AuthScreen({ onAuthenticated }) {
             <h2 className="mt-2 text-3xl font-extrabold tracking-[-0.045em]">{mode === "login" ? "Sign in to continue" : "Create your account"}</h2>
             <p className="mt-2 text-xs leading-relaxed text-[#7f929b]">{mode === "login" ? "Pick up right where your conversations left off." : "Start messaging in less than a minute."}</p>
 
-            <form className="mt-8 space-y-4" onSubmit={submit}>
-              <label className="block"><span className="mb-2 block text-[11px] font-bold text-white/65">Email address</span><span className="flex h-12 items-center gap-3 rounded-2xl border border-white/[0.07] bg-black/15 px-4 focus-within:border-emerald-400/35"><Mail size={17} className="text-[#71868e]" /><input required type="email" autoComplete="email" value={form.email} onChange={update("email")} placeholder="you@example.com" className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-white/25" /></span></label>
-              {mode === "register" ? <label className="block"><span className="mb-2 block text-[11px] font-bold text-white/65">Mobile number</span><span className="flex h-12 items-center gap-3 rounded-2xl border border-white/[0.07] bg-black/15 px-4 focus-within:border-emerald-400/35"><Phone size={17} className="text-[#71868e]" /><input required inputMode="numeric" pattern="[0-9]{10}" value={form.mobileNumber} onChange={update("mobileNumber")} placeholder="10-digit number" className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-white/25" /></span></label> : null}
-              <label className="block"><span className="mb-2 block text-[11px] font-bold text-white/65">Password</span><span className="flex h-12 items-center gap-3 rounded-2xl border border-white/[0.07] bg-black/15 px-4 focus-within:border-emerald-400/35"><LockKeyhole size={17} className="text-[#71868e]" /><input required minLength={8} type={showPassword ? "text" : "password"} autoComplete={mode === "login" ? "current-password" : "new-password"} value={form.password} onChange={update("password")} placeholder="At least 8 characters" className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-white/25" /><button type="button" onClick={() => setShowPassword((value) => !value)} className="rounded-lg p-1 text-white/35 hover:text-white" aria-label={showPassword ? "Hide password" : "Show password"}>{showPassword ? <EyeOff size={17} /> : <Eye size={17} />}</button></span></label>
+            <form className="mt-8 space-y-4" onSubmit={submit} aria-busy={submitting}>
+              <label className="block"><span className="mb-2 block text-[11px] font-bold text-white/65">Email address</span><span className="flex h-12 items-center gap-3 rounded-2xl border border-white/[0.07] bg-black/15 px-4 focus-within:border-emerald-400/35"><Mail size={17} className="text-[#71868e]" /><input required name="email" maxLength={50} type="email" autoComplete="email" value={form.email} onChange={update("email")} placeholder="you@example.com" className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-white/25" /></span></label>
+              {mode === "register" ? <label className="block"><span className="mb-2 block text-[11px] font-bold text-white/65">Mobile number</span><span className="flex h-12 items-center gap-3 rounded-2xl border border-white/[0.07] bg-black/15 px-4 focus-within:border-emerald-400/35"><Phone size={17} className="text-[#71868e]" /><input required name="mobileNumber" type="tel" inputMode="numeric" autoComplete="tel" pattern="[0-9]{10}" maxLength={10} value={form.mobileNumber} onChange={update("mobileNumber")} placeholder="10-digit number" className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-white/25" /></span></label> : null}
+              <label className="block"><span className="mb-2 block text-[11px] font-bold text-white/65">Password</span><span className="flex h-12 items-center gap-3 rounded-2xl border border-white/[0.07] bg-black/15 px-4 focus-within:border-emerald-400/35"><LockKeyhole size={17} className="text-[#71868e]" /><input required name="password" minLength={8} maxLength={72} type={showPassword ? "text" : "password"} autoComplete={mode === "login" ? "current-password" : "new-password"} value={form.password} onChange={update("password")} placeholder="At least 8 characters" className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-white/25" /><button type="button" onClick={() => setShowPassword((value) => !value)} className="rounded-lg p-1 text-white/35 hover:text-white" aria-label={showPassword ? "Hide password" : "Show password"}>{showPassword ? <EyeOff size={17} /> : <Eye size={17} />}</button></span></label>
 
               {error ? <p className="rounded-xl border border-rose-400/20 bg-rose-400/[0.08] px-3 py-2.5 text-xs text-rose-200" role="alert">{error}</p> : null}
 
@@ -65,7 +74,7 @@ export default function AuthScreen({ onAuthenticated }) {
               </button>
             </form>
 
-            <p className="mt-6 text-center text-xs text-[#71858e]">{mode === "login" ? "New to Wavely?" : "Already have an account?"} <button type="button" onClick={() => { setMode((value) => value === "login" ? "register" : "login"); setError(""); }} className="font-bold text-emerald-300 hover:text-emerald-200">{mode === "login" ? "Create an account" : "Sign in"}</button></p>
+            <p className="mt-6 text-center text-xs text-[#71858e]">{mode === "login" ? "New to Wavely?" : "Already have an account?"} <button type="button" onClick={() => { setMode((value) => value === "login" ? "register" : "login"); setForm((value) => ({ ...value, password: "", mobileNumber: "" })); setShowPassword(false); setError(""); }} className="font-bold text-emerald-300 hover:text-emerald-200">{mode === "login" ? "Create an account" : "Sign in"}</button></p>
           </div>
         </section>
       </div>

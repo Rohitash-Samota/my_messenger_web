@@ -13,7 +13,7 @@ const noStoreHeaders = {
   "Cache-Control": "no-store, max-age=0",
 };
 
-const supportedMessageTypes = new Set(["text", "image", "document", "audio"]);
+const supportedMessageTypes = new Set(["text", "image", "video", "document", "audio"]);
 
 const errorResponse = (status, code, message, details = null) =>
   NextResponse.json(
@@ -54,8 +54,8 @@ function normalisePayload(payload) {
     return { error: "Message text is required." };
   }
 
-  if (type === "image" && !media?.url) {
-    return { error: "Image messages require media.url." };
+  if ((type === "image" || type === "video") && !media?.url) {
+    return { error: `${type === "image" ? "Image" : "Video"} messages require media.url.` };
   }
 
   if (type === "document" && !file?.name) {

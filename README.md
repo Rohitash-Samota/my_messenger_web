@@ -4,13 +4,23 @@ A responsive WhatsApp-inspired messenger built with Next.js 16, React 19, Tailwi
 
 ## Getting started
 
+Start the sibling Spring service first:
+
+```bash
+cd ../my-messenger
+docker compose up -d
+mvn spring-boot:run
+```
+
+Then start Wavely in another terminal:
+
 ```bash
 npm install
 cp .env.example .env.local
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) in your browser.
+Open [http://localhost:3000](http://localhost:3000) in your browser. Registering creates the user through the Spring API and signs them in immediately; returning users can sign in with the same email and password.
 
 ## Scripts
 
@@ -21,7 +31,7 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 ## Demo API
 
-When `NEXT_PUBLIC_API_BASE_URL` is empty, the app uses its built-in Next.js demo endpoints:
+To use the built-in demo instead, clear both public environment values in `.env.local`. Demo mode skips account authentication and uses these Next.js endpoints:
 
 - `GET /api/conversations` returns the conversation list.
 - `GET /api/conversations/:id/messages` returns a conversation and its message history.

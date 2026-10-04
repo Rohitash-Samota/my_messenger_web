@@ -847,6 +847,7 @@ export function listMessages(conversationId) {
 
 const previewForMessage = (message) => {
   if (message.type === "image") return message.text || "Photo";
+  if (message.type === "video") return message.text || "Video";
   if (message.type === "audio") return "Voice message";
   if (message.type === "document") return message.file?.name || "Document";
   return message.text;

@@ -1029,13 +1029,19 @@ export default function MessengerApp() {
   useEffect(() => {
     if (!externalApiEnabled) return undefined;
     const syncSession = (session = getAuthSession()) => {
-      setAccessToken(session?.accessToken || "");
-      setAuthenticated(Boolean(session?.accessToken));
-      setCurrentUser((user) => user || (session?.email ? {
-        id: null,
-        email: session.email,
-        name: nameFromEmail(session.email),
-      } : null));
+      const token = session?.accessToken || "";
+      const sessionEmail = String(session?.email || "").toLowerCase();
+      setAccessToken(token);
+      setAuthenticated(Boolean(token));
+      setCurrentUser((user) => {
+        if (!token) return null;
+        if (user?.email && String(user.email).toLowerCase() === sessionEmail) return user;
+        return sessionEmail ? {
+          id: null,
+          email: sessionEmail,
+          name: nameFromEmail(sessionEmail),
+        } : null;
+      });
       setAuthReady(true);
     };
     const unsubscribe = subscribeAuthSession(syncSession);
@@ -1247,10 +1253,17 @@ export default function MessengerApp() {
       const mediaUrl = uploaded.url || uploaded.path || uploaded.downloadUrl;
       if (!mediaUrl) throw new Error("The server did not return a media URL.");
       const uploadedType = String(uploaded.messageType || type).toLowerCase();
+      const uploadedMedia = {
+        url: mediaUrl,
+        contentType: uploaded.contentType || file.type,
+        alt: uploaded.originalFilename || uploaded.fileName || file.name,
+      };
       const result = await sendMessage(selected.id, {
         clientMessageId,
         type: uploadedType,
         content: mediaUrl,
+        media: uploadedMedia,
+        duration: metadata.duration ?? null,
       });
       const saved = result?.message || result;
       const normalized = normalizeMessage(saved, currentUser?.id);
@@ -1260,11 +1273,7 @@ export default function MessengerApp() {
         direction: "outgoing",
         type: uploadedType,
         duration,
-        media: {
-          url: mediaUrl,
-          contentType: uploaded.contentType || file.type,
-          alt: uploaded.originalFilename || uploaded.fileName || file.name,
-        },
+        media: uploadedMedia,
       }, optimistic.id));
       URL.revokeObjectURL(localUrl);
       const preview = uploadedType === "audio" ? "Voice message" : uploadedType === "image" ? "Photo" : "Video";
@@ -1314,15 +1323,24 @@ export default function MessengerApp() {
     ? conversations.find((item) => String(item.signalConversationId || item.id) === String(callControls.call.conversationId)) || selected || fallbackConversation
     : null;
 
+  const handleAuthenticated = (session) => {
+    const token = session?.accessToken || getAccessToken() || "";
+    if (!token) throw new Error("The authentication service did not return a valid session.");
+    setAccessToken(token);
+    setCurrentUser(session?.email ? {
+      id: null,
+      email: session.email,
+      name: nameFromEmail(session.email),
+    } : null);
+    setAuthenticated(true);
+  };
+
   if (!authReady) {
     return <div className="grid min-h-screen place-items-center bg-[#071116]"><span className="h-7 w-7 animate-spin rounded-full border-2 border-emerald-300 border-t-transparent" /></div>;
   }
 
   if (!authenticated) {
-    return <AuthScreen onAuthenticated={(session) => {
-      setAccessToken(session?.accessToken || getAccessToken() || "");
-      setAuthenticated(true);
-    }} />;
+    return <AuthScreen onAuthenticated={handleAuthenticated} />;
   }
 
   return (
