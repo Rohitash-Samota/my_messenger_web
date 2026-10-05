@@ -4,7 +4,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { createRealtimeClient } from "@/lib/realtime-client";
 
-const messageEvents = new Set(["MESSAGE_CREATED", "MESSAGE_SENT", "NEW_MESSAGE"]);
+const messageEvents = new Set([
+  "MESSAGE_CREATED",
+  "MESSAGE_SENT",
+  "NEW_MESSAGE",
+  "MESSAGE_UPDATED",
+  "MESSAGE_DELETED",
+]);
 const receiptEvents = new Set([
   "MESSAGE_STATE_CHANGED",
   "MESSAGE_DELIVERED",

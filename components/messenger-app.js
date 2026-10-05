@@ -2,6 +2,7 @@
 
 import {
   Archive,
+  ArchiveRestore,
   ArrowLeft,
   BellOff,
   Camera,
@@ -10,12 +11,14 @@ import {
   CircleDashed,
   Image as ImageIcon,
   LockKeyhole,
+  LogOut,
   MessageCircle,
   Mic,
   MoreVertical,
   Paperclip,
   Phone,
   Pin,
+  RefreshCw,
   Search,
   Send,
   Settings,
@@ -40,6 +43,8 @@ import useCall from "@/hooks/use-call";
 import useRealtimeChat from "@/hooks/use-realtime-chat";
 import {
   createConversation,
+  deleteMessage as deleteMessageRequest,
+  editMessage as editMessageRequest,
   externalApiEnabled,
   getAccessToken,
   getAuthSession,
@@ -48,9 +53,11 @@ import {
   getMessages,
   markMessagesDelivered,
   markMessagesRead,
+  logout,
   searchUsers,
   sendMessage,
   subscribeAuthSession,
+  updateConversationFlags,
   uploadMedia,
 } from "@/lib/api";
 
@@ -63,6 +70,8 @@ const navItems = [
 
 const filters = ["All", "Unread", "Groups"];
 const emojis = ["😀", "😂", "😍", "🥰", "😎", "🤝", "🙌", "🔥", "✨", "🎉", "❤️", "👍", "🙏", "👀", "💯"];
+const CHAT_PREFERENCES_KEY = "wavely.chat.preferences";
+const STARRED_MESSAGES_KEY = "wavely.starred.messages";
 
 const fallbackConversation = {
   id: "maya",
@@ -117,6 +126,19 @@ function formatTimestamp(value, { list = false } = {}) {
   return date.toLocaleDateString([], { day: "2-digit", month: "short" });
 }
 
+function formatMessageDate(value) {
+  if (!value) return "Messages";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Messages";
+  const today = new Date();
+  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const startOfDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const difference = Math.round((startOfToday - startOfDate) / 86_400_000);
+  if (difference === 0) return "Today";
+  if (difference === 1) return "Yesterday";
+  return date.toLocaleDateString([], { day: "numeric", month: "short", year: "numeric" });
+}
+
 function normalizeConversation(item, index = 0) {
   const id = item.id ?? item.conversationId ?? item.conversionId;
   const type = String(item.type || item.conversationType || item.conversionType || "direct").toLowerCase();
@@ -141,6 +163,9 @@ function normalizeConversation(item, index = 0) {
     lastMessage: item.lastMessage?.text || item.lastMessage || (item.lastMessageId ? "Open to view recent messages" : "Start a conversation"),
     lastMessageAt: formatTimestamp(item.lastMessageAt || item.lastActivityAt || item.time, { list: true }),
     unread: Number(item.unread ?? item.unreadCount ?? 0),
+    pinned: Boolean(item.pinned),
+    archived: Boolean(item.archived),
+    muted: Boolean(item.muted),
   };
 }
 
@@ -169,7 +194,17 @@ function normalizeMessage(item, currentUserId = null) {
     caption: item.caption || (isMedia && item.media ? content : ""),
     type,
     status: String(item.status || "sent").toLowerCase(),
+    createdAt:
+      item.createdAt ||
+      (typeof item.time === "string" && !Number.isNaN(new Date(item.time).getTime())
+        ? item.time
+        : null),
     time: formatTimestamp(item.time || item.createdAt),
+    edited: Boolean(item.edited || item.editedAt),
+    editedAt: item.editedAt || null,
+    deleted: Boolean(item.deleted || item.deletedAt),
+    deletedAt: item.deletedAt || null,
+    revision: Number(item.revision ?? item.version ?? 0) || 0,
     duration,
     media: mediaUrl ? { ...(typeof item.media === "object" ? item.media : {}), url: mediaUrl } : null,
     file:
@@ -190,6 +225,29 @@ function normalizeMessage(item, currentUserId = null) {
   };
 }
 
+function sortConversations(items) {
+  return [...items].sort((left, right) => {
+    if (left.pinned !== right.pinned) return left.pinned ? -1 : 1;
+    const leftDate = new Date(left.lastActivityAt || left.lastMessageAt || 0).getTime();
+    const rightDate = new Date(right.lastActivityAt || right.lastMessageAt || 0).getTime();
+    return rightDate - leftDate;
+  });
+}
+
+function readStoredObject(key) {
+  if (typeof window === "undefined") return {};
+  try {
+    return JSON.parse(window.localStorage.getItem(key) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+
+function storeObject(key, value) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(key, JSON.stringify(value));
+}
+
 function unwrapList(result, key) {
   if (Array.isArray(result)) return result;
   if (Array.isArray(result?.[key])) return result[key];
@@ -204,13 +262,18 @@ function messageKey(message) {
 function upsertMessage(items, message, replaceId = null) {
   const nextKey = messageKey(message);
   const clientId = message?.clientMessageId;
+  const existing = items.find((item) =>
+    (nextKey && messageKey(item) === nextKey) ||
+    (clientId && item.clientMessageId === clientId),
+  );
+  const nextMessage = existing ? mergeMessageMutation(existing, message) : message;
   const filtered = items.filter((item) => {
     if (replaceId != null && String(item.id) === String(replaceId)) return false;
     if (nextKey && messageKey(item) === nextKey) return false;
     if (clientId && item.clientMessageId === clientId) return false;
     return true;
   });
-  return [...filtered, message].sort((left, right) => {
+  return [...filtered, nextMessage].sort((left, right) => {
     const leftDate = new Date(left.createdAt || 0).getTime();
     const rightDate = new Date(right.createdAt || 0).getTime();
     if (leftDate && rightDate && leftDate !== rightDate) return leftDate - rightDate;
@@ -218,6 +281,18 @@ function upsertMessage(items, message, replaceId = null) {
     const rightId = Number(right.id);
     return Number.isFinite(leftId) && Number.isFinite(rightId) ? leftId - rightId : 0;
   });
+}
+
+function mergeMessageMutation(current, incoming) {
+  const currentRevision = Number(current?.revision || 0);
+  const incomingRevision = Number(incoming?.revision || 0);
+  if (current?.deleted && !incoming?.deleted) return current;
+  if (incomingRevision < currentRevision) return current;
+  return {
+    ...current,
+    ...incoming,
+    direction: current?.direction || incoming?.direction,
+  };
 }
 
 function IconButton({ label, children, active = false, className = "", ...props }) {
@@ -236,6 +311,22 @@ function IconButton({ label, children, active = false, className = "", ...props 
   );
 }
 
+function MenuItem({ icon: Icon, label, onClick, danger = false, disabled = false }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-35 ${
+        danger ? "text-rose-300 hover:bg-rose-400/10" : "text-white/75 hover:bg-white/[0.07] hover:text-white"
+      }`}
+    >
+      <Icon size={16} />
+      {label}
+    </button>
+  );
+}
+
 function Logo() {
   return (
     <div className="grid h-10 w-10 place-items-center rounded-[14px] bg-gradient-to-br from-emerald-300 via-emerald-400 to-teal-600 text-[#06271e] shadow-lg shadow-emerald-950/40">
@@ -244,7 +335,7 @@ function Logo() {
   );
 }
 
-function NavRail({ current, onChange }) {
+function NavRail({ current, onChange, currentUser, onSettings }) {
   return (
     <nav className="hidden w-[72px] shrink-0 flex-col items-center border-r border-white/[0.06] bg-[#091319] py-4 md:flex" aria-label="Primary navigation">
       <Logo />
@@ -259,10 +350,16 @@ function NavRail({ current, onChange }) {
         })}
       </div>
       <div className="flex flex-col items-center gap-2">
-        <IconButton label="Settings">
+        <IconButton label="Settings" onClick={onSettings}>
           <Settings size={20} />
         </IconButton>
-        <Avatar name="Rohit Samota" color="amber" size="sm" online />
+        <Avatar
+          name={currentUser?.name || currentUser?.email || "You"}
+          src={currentUser?.profilePhoto}
+          color="amber"
+          size="sm"
+          online
+        />
       </div>
     </nav>
   );
@@ -301,40 +398,78 @@ function ConversationSkeleton() {
   );
 }
 
-function ConversationRow({ conversation, selected, onSelect }) {
+function ConversationRow({
+  conversation,
+  selected,
+  onSelect,
+  onPin,
+  onArchive,
+  onMute,
+  archivedMode,
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const runAction = (action) => {
+    setMenuOpen(false);
+    void action(conversation);
+  };
+
   return (
-    <button
-      type="button"
-      onClick={onSelect}
-      aria-current={selected ? "page" : undefined}
-      className={`group flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left outline-none transition focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-emerald-400/60 ${
-        selected ? "bg-[#1d3037]" : "hover:bg-white/[0.045]"
-      }`}
-    >
-      <Avatar name={conversation.name} color={conversation.color} size="md" online={conversation.online} />
-      <span className="min-w-0 flex-1">
-        <span className="flex items-center gap-2">
-          <span className="truncate text-[13.5px] font-bold text-[#ecf2f3]">{conversation.name}</span>
-          {conversation.pinned ? <Pin size={11} className="ml-auto shrink-0 rotate-45 text-[#84979f]" /> : null}
-          <span className={`shrink-0 text-[10px] font-medium ${conversation.unread ? "text-emerald-300" : "text-[#71858e]"}`}>
-            {conversation.lastMessageAt || conversation.time}
-          </span>
-        </span>
-        <span className="mt-1 flex items-center gap-1.5">
-          {conversation.mine ? <CheckCheck size={13} className="shrink-0 text-sky-400" /> : null}
-          <span className={`min-w-0 flex-1 truncate text-xs ${conversation.draft ? "text-emerald-300" : "text-[#84969e]"}`}>
-            {conversation.draft ? <strong>Draft: </strong> : null}
-            {conversation.lastMessage}
-          </span>
-          {conversation.muted ? <BellOff size={12} className="shrink-0 text-[#71858e]" /> : null}
-          {conversation.unread ? (
-            <span className="grid min-w-5 shrink-0 place-items-center rounded-full bg-emerald-400 px-1.5 py-0.5 text-[9px] font-extrabold text-[#05251d]">
-              {conversation.unread > 99 ? "99+" : conversation.unread}
+    <div className="group relative">
+      <button
+        type="button"
+        onClick={onSelect}
+        aria-current={selected ? "page" : undefined}
+        className={`flex w-full items-center gap-3 rounded-2xl px-3 py-3 pr-11 text-left outline-none transition focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-emerald-400/60 ${
+          selected ? "bg-[#1d3037]" : "hover:bg-white/[0.045]"
+        }`}
+      >
+        <Avatar
+          name={conversation.name}
+          src={conversation.profilePhoto || conversation.avatar?.image}
+          color={conversation.color}
+          size="md"
+          online={conversation.online}
+        />
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-2">
+            <span className="truncate text-[13.5px] font-bold text-[#ecf2f3]">{conversation.name}</span>
+            {conversation.pinned ? <Pin size={11} className="ml-auto shrink-0 rotate-45 text-[#84979f]" /> : null}
+            <span className={`shrink-0 text-[10px] font-medium ${conversation.unread ? "text-emerald-300" : "text-[#71858e]"}`}>
+              {conversation.lastMessageAt || conversation.time}
             </span>
-          ) : null}
+          </span>
+          <span className="mt-1 flex items-center gap-1.5">
+            {conversation.mine ? <CheckCheck size={13} className="shrink-0 text-sky-400" /> : null}
+            <span className={`min-w-0 flex-1 truncate text-xs ${conversation.draft ? "text-emerald-300" : "text-[#84969e]"}`}>
+              {conversation.draft ? <strong>Draft: </strong> : null}
+              {conversation.lastMessage}
+            </span>
+            {conversation.muted ? <BellOff size={12} className="shrink-0 text-[#71858e]" /> : null}
+            {conversation.unread ? (
+              <span className="grid min-w-5 shrink-0 place-items-center rounded-full bg-emerald-400 px-1.5 py-0.5 text-[9px] font-extrabold text-[#05251d]">
+                {conversation.unread > 99 ? "99+" : conversation.unread}
+              </span>
+            ) : null}
+          </span>
         </span>
-      </span>
-    </button>
+      </button>
+      <button
+        type="button"
+        onClick={() => setMenuOpen((value) => !value)}
+        aria-label={`Actions for ${conversation.name}`}
+        aria-expanded={menuOpen}
+        className="absolute right-2 top-1/2 grid h-8 w-8 -translate-y-1/2 place-items-center rounded-lg text-[#84969e] opacity-100 transition hover:bg-white/10 hover:text-white md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100"
+      >
+        <MoreVertical size={17} />
+      </button>
+      {menuOpen ? (
+        <div className="glass-popover absolute right-2 top-[70%] z-40 w-48 rounded-2xl p-1.5" role="menu">
+          <MenuItem icon={Pin} label={conversation.pinned ? "Unpin chat" : "Pin chat"} onClick={() => runAction(onPin)} />
+          <MenuItem icon={BellOff} label={conversation.muted ? "Unmute notifications" : "Mute notifications"} onClick={() => runAction(onMute)} />
+          <MenuItem icon={archivedMode ? ArchiveRestore : Archive} label={archivedMode ? "Unarchive chat" : "Archive chat"} onClick={() => runAction(onArchive)} />
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -348,9 +483,19 @@ function Sidebar({
   onNewChat,
   mobileThread,
   connectionStatus,
+  nav,
+  onNavChange,
+  archivedMode,
+  onToggleArchived,
+  onPin,
+  onArchive,
+  onMute,
+  onSettings,
+  onLogout,
 }) {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("All");
+  const [inboxMenuOpen, setInboxMenuOpen] = useState(false);
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
     return conversations.filter((conversation) => {
@@ -370,7 +515,7 @@ function Sidebar({
           <div className="flex items-center gap-2.5">
             <span className="md:hidden"><Logo /></span>
             <div>
-              <h1 className="text-[21px] font-extrabold tracking-[-0.04em] text-white">Messages</h1>
+              <h1 className="text-[21px] font-extrabold tracking-[-0.04em] text-white">{archivedMode ? "Archived" : "Messages"}</h1>
               <p className={`mt-0.5 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.16em] ${connectionStatus === "connected" ? "text-emerald-300/80" : connectionStatus === "error" ? "text-rose-300/80" : "text-white/35"}`}>
                 <span className={`h-1.5 w-1.5 rounded-full ${connectionStatus === "connected" ? "bg-emerald-300" : connectionStatus === "error" ? "bg-rose-300" : "bg-amber-300/70"}`} />
                 {connectionStatus === "connected" ? "Live inbox" : connectionStatus === "demo" ? "Demo inbox" : connectionStatus === "error" ? "REST fallback" : "Connecting"}
@@ -379,8 +524,17 @@ function Sidebar({
           </div>
         </div>
         <div className="flex items-center gap-1">
-          <IconButton label="New conversation" onClick={onNewChat}><SquarePen size={19} /></IconButton>
-          <IconButton label="Inbox menu"><MoreVertical size={19} /></IconButton>
+          {!archivedMode ? <IconButton label="New conversation" onClick={onNewChat}><SquarePen size={19} /></IconButton> : null}
+          <div className="relative">
+            <IconButton label="Inbox menu" active={inboxMenuOpen} onClick={() => setInboxMenuOpen((value) => !value)} aria-expanded={inboxMenuOpen}><MoreVertical size={19} /></IconButton>
+            {inboxMenuOpen ? (
+              <div className="glass-popover absolute right-0 top-11 z-50 w-48 rounded-2xl p-1.5" role="menu">
+                <MenuItem icon={RefreshCw} label="Refresh chats" onClick={() => { setInboxMenuOpen(false); onRetry(); }} />
+                <MenuItem icon={Settings} label="Settings" onClick={() => { setInboxMenuOpen(false); onSettings(); }} />
+                {externalApiEnabled ? <MenuItem icon={LogOut} label="Log out" danger onClick={() => { setInboxMenuOpen(false); onLogout(); }} /> : null}
+              </div>
+            ) : null}
+          </div>
         </div>
       </header>
 
@@ -399,10 +553,10 @@ function Sidebar({
         </div>
       </div>
 
-      <button type="button" className="mx-3 flex items-center gap-3 rounded-xl px-3 py-2.5 text-left text-xs font-semibold text-[#95a7ae] transition hover:bg-white/[0.04] hover:text-white">
-        <span className="grid h-9 w-9 place-items-center rounded-xl bg-[#19272e] text-emerald-300"><Archive size={17} /></span>
-        Archived
-        <span className="ml-auto text-[10px] text-emerald-300">4</span>
+      <button type="button" onClick={onToggleArchived} className="mx-3 flex items-center gap-3 rounded-xl px-3 py-2.5 text-left text-xs font-semibold text-[#95a7ae] transition hover:bg-white/[0.04] hover:text-white">
+        <span className="grid h-9 w-9 place-items-center rounded-xl bg-[#19272e] text-emerald-300">{archivedMode ? <ArrowLeft size={17} /> : <Archive size={17} />}</span>
+        {archivedMode ? "Back to inbox" : "Archived chats"}
+        <ChevronRight size={14} className="ml-auto" />
       </button>
 
       <div className="soft-scrollbar min-h-0 flex-1 overflow-y-auto px-2 pb-3 pt-1">
@@ -423,10 +577,19 @@ function Sidebar({
           </div>
         ) : null}
         {filtered.map((conversation) => (
-          <ConversationRow key={conversation.id} conversation={conversation} selected={String(conversation.id) === String(selectedId)} onSelect={() => onSelect(conversation)} />
+          <ConversationRow
+            key={conversation.id}
+            conversation={conversation}
+            selected={String(conversation.id) === String(selectedId)}
+            onSelect={() => onSelect(conversation)}
+            onPin={onPin}
+            onArchive={onArchive}
+            onMute={onMute}
+            archivedMode={archivedMode}
+          />
         ))}
       </div>
-      <MobileNav current="chats" onChange={() => {}} />
+      <MobileNav current={nav} onChange={onNavChange} />
     </aside>
   );
 }
@@ -440,7 +603,7 @@ function EmptyChat() {
       </div>
       <h2 className="mt-7 text-2xl font-extrabold tracking-tight">Your conversations, together</h2>
       <p className="mt-2 max-w-sm text-sm leading-relaxed text-[#80939c]">Choose a chat from the inbox to start messaging securely from any device.</p>
-      <p className="mt-10 flex items-center gap-2 text-[10px] text-[#687d86]"><LockKeyhole size={13} /> Private messages are end-to-end encrypted</p>
+      <p className="mt-10 flex items-center gap-2 text-[10px] text-[#687d86]"><LockKeyhole size={13} /> Protected by authenticated access</p>
     </section>
   );
 }
@@ -486,7 +649,7 @@ function EmojiPicker({ onPick }) {
   );
 }
 
-function Composer({ onSend, onUpload, sending, uploading, sendError }) {
+function Composer({ onSend, onUpload, sending, uploading, sendError, replyTo, onCancelReply }) {
   const [text, setText] = useState("");
   const [menu, setMenu] = useState(null);
   const [recording, setRecording] = useState(false);
@@ -530,7 +693,8 @@ function Composer({ onSend, onUpload, sending, uploading, sendError }) {
     setMenu(null);
     setLocalError("");
     try {
-      await onSend({ text: value, type: "text" });
+      await onSend({ text: value, type: "text", replyTo });
+      onCancelReply?.();
     } catch (messageError) {
       setText(value);
       setLocalError(messageError.message || "Message not sent.");
@@ -619,25 +783,34 @@ function Composer({ onSend, onUpload, sending, uploading, sendError }) {
 
   return (
     <footer className="relative z-20 shrink-0 border-t border-white/[0.06] bg-[#111d23]/95 px-3 pb-[max(12px,env(safe-area-inset-bottom))] pt-3 backdrop-blur-xl md:px-4">
+      {replyTo ? (
+        <div className="mx-auto mb-2 flex max-w-4xl items-center gap-3 rounded-xl border-l-2 border-emerald-400 bg-black/15 px-3 py-2">
+          <span className="min-w-0 flex-1">
+            <span className="block text-[10px] font-bold text-emerald-300">Replying to {replyTo.sender || (replyTo.direction === "outgoing" ? "yourself" : "message")}</span>
+            <span className="block truncate text-[11px] text-white/45">{replyTo.deleted ? "This message was deleted" : replyTo.text || replyTo.caption || "Attachment"}</span>
+          </span>
+          <IconButton label="Cancel reply" onClick={onCancelReply} className="h-8 w-8"><X size={15} /></IconButton>
+        </div>
+      ) : null}
       <div className="mx-auto flex max-w-4xl items-end gap-1.5">
         <div className="relative">
-          <IconButton label="Choose emoji" active={menu === "emoji"} onClick={() => setMenu((value) => value === "emoji" ? null : "emoji")} aria-expanded={menu === "emoji"}><Smile size={20} /></IconButton>
+          <IconButton disabled={recording} label="Choose emoji" active={menu === "emoji"} onClick={() => setMenu((value) => value === "emoji" ? null : "emoji")} aria-expanded={menu === "emoji"}><Smile size={20} /></IconButton>
           {menu === "emoji" ? <EmojiPicker onPick={(emoji) => { setText((value) => `${value}${emoji}`); textareaRef.current?.focus(); }} /> : null}
         </div>
         <div className="relative">
-          <IconButton label="Attach a file" active={menu === "attach"} onClick={() => setMenu((value) => value === "attach" ? null : "attach")} aria-expanded={menu === "attach"}><Paperclip size={20} /></IconButton>
+          <IconButton disabled={recording} label="Add media" active={menu === "attach"} onClick={() => setMenu((value) => value === "attach" ? null : "attach")} aria-expanded={menu === "attach"}><Paperclip size={20} /></IconButton>
           {menu === "attach" ? <AttachmentMenu onChoose={chooseAttachment} onClose={() => setMenu(null)} /> : null}
           <input ref={mediaInputRef} type="file" accept="image/*,video/*" className="hidden" onChange={uploadSelection} />
           <input ref={cameraInputRef} type="file" accept="image/*,video/*" capture="environment" className="hidden" onChange={uploadSelection} />
         </div>
         <label className={`flex min-h-11 min-w-0 flex-1 items-end rounded-2xl border px-4 py-2.5 ${recording ? "border-rose-400/25 bg-rose-400/[0.07]" : "border-white/[0.06] bg-[#1b2a31] focus-within:border-emerald-400/25"}`}>
-          {recording ? <span className="flex min-h-[22px] items-center gap-2 text-xs font-bold text-rose-200"><span className="h-2 w-2 animate-pulse rounded-full bg-rose-400" /> Recording {Math.floor(recordingSeconds / 60)}:{String(recordingSeconds % 60).padStart(2, "0")}</span> : <textarea ref={textareaRef} rows={1} value={text} onChange={(event) => setText(event.target.value)} onKeyDown={onKeyDown} placeholder={uploading ? "Uploading attachment…" : "Type a message"} aria-label="Message" disabled={uploading} className="soft-scrollbar max-h-28 min-h-[22px] w-full resize-none bg-transparent text-[13px] leading-[22px] text-white outline-none placeholder:text-[#71858e] disabled:opacity-60" />}
+          {recording ? <span className="flex min-h-[22px] items-center gap-2 text-xs font-bold text-rose-200"><span className="h-2 w-2 animate-pulse rounded-full bg-rose-400" /> Recording {Math.floor(recordingSeconds / 60)}:{String(recordingSeconds % 60).padStart(2, "0")}</span> : <textarea ref={textareaRef} rows={1} maxLength={1000} value={text} onChange={(event) => setText(event.target.value)} onKeyDown={onKeyDown} placeholder={uploading ? "Uploading attachment…" : "Type a message"} aria-label="Message" disabled={uploading} className="soft-scrollbar max-h-28 min-h-[22px] w-full resize-none bg-transparent text-[13px] leading-[22px] text-white outline-none placeholder:text-[#71858e] disabled:opacity-60" />}
         </label>
         <button disabled={(sending || uploading) && !recording} type="button" onClick={text.trim() ? submit : recording ? stopRecording : startRecording} className={`grid h-11 w-11 shrink-0 place-items-center rounded-2xl transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300 disabled:cursor-wait disabled:opacity-50 ${text.trim() ? "bg-emerald-400 text-[#06271e] shadow-lg shadow-emerald-950/40 hover:bg-emerald-300" : recording ? "bg-rose-500 text-white" : "bg-[#1b2a31] text-[#91a4ac] hover:bg-[#21343c]"}`} aria-label={text.trim() ? "Send message" : recording ? "Stop voice recording" : "Record voice message"}>
           {text.trim() ? <Send size={18} fill="currentColor" /> : recording ? <Square size={16} fill="currentColor" /> : <Mic size={20} />}
         </button>
       </div>
-      {uploading ? <p className="mx-auto mt-2 max-w-4xl text-[10px] font-semibold text-emerald-300">Uploading securely…</p> : null}
+      {uploading ? <p className="mx-auto mt-2 max-w-4xl text-[10px] font-semibold text-emerald-300">Uploading attachment…</p> : null}
       {localError || sendError ? <p className="mx-auto mt-2 max-w-4xl text-[10px] font-semibold text-rose-300" role="alert">{localError || sendError}</p> : null}
     </footer>
   );
@@ -658,8 +831,31 @@ function ChatPane({
   uploading,
   sendError,
   mobileThread,
+  starredMessageIds,
+  onEditMessage,
+  onDeleteMessage,
+  onStarMessage,
+  onRetryMessage,
+  onCopyMessage,
+  onPin,
+  onArchive,
+  onMute,
+  archivedMode,
 }) {
   const endRef = useRef(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [replyTo, setReplyTo] = useState(null);
+  const visibleMessages = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return messages;
+    return messages.filter((message) =>
+      `${message.text || ""} ${message.caption || ""} ${message.file?.name || ""}`
+        .toLowerCase()
+        .includes(query),
+    );
+  }, [messages, searchQuery]);
   useEffect(() => { endRef.current?.scrollIntoView({ block: "end" }); }, [messages, conversation?.id]);
 
   if (!conversation) return <EmptyChat />;
@@ -669,19 +865,37 @@ function ChatPane({
       <header className="z-20 flex h-[72px] shrink-0 items-center gap-2 border-b border-white/[0.06] bg-[#111d23]/95 px-2 pt-[env(safe-area-inset-top)] backdrop-blur-xl sm:px-4">
         <IconButton label="Back to conversations" className="md:hidden" onClick={onBack}><ArrowLeft size={21} /></IconButton>
         <button type="button" className="flex min-w-0 items-center gap-3 rounded-xl p-1 pr-3 text-left transition hover:bg-white/[0.04]" onClick={onToggleDetails}>
-          <Avatar name={conversation.name} color={conversation.color} size="sm" online={conversation.online} />
+          <Avatar name={conversation.name} src={conversation.profilePhoto || conversation.avatar?.image} color={conversation.color} size="sm" online={conversation.online} />
           <span className="min-w-0">
             <span className="block truncate text-[13px] font-extrabold text-[#edf3f4]">{conversation.name}</span>
             <span className={`block truncate text-[10px] font-medium ${conversation.online ? "text-emerald-300" : "text-[#7f929b]"}`}>{conversation.status || (conversation.online ? "online" : "last seen recently")}</span>
           </span>
         </button>
         <div className="ml-auto flex items-center gap-0.5">
-          <IconButton label="Start video call" onClick={() => onStartCall("video")}><Video size={19} /></IconButton>
-          <IconButton label="Start voice call" onClick={() => onStartCall("audio")}><Phone size={18} /></IconButton>
-          <IconButton label="Search in conversation" className="hidden sm:grid"><Search size={18} /></IconButton>
-          <IconButton label="Conversation menu"><MoreVertical size={18} /></IconButton>
+          {conversation.type !== "group" ? <IconButton label="Start video call" onClick={() => onStartCall("video")}><Video size={19} /></IconButton> : null}
+          {conversation.type !== "group" ? <IconButton label="Start voice call" onClick={() => onStartCall("audio")}><Phone size={18} /></IconButton> : null}
+          <IconButton label="Search in conversation" active={searchOpen} onClick={() => setSearchOpen((value) => !value)}><Search size={18} /></IconButton>
+          <div className="relative">
+            <IconButton label="Conversation menu" active={menuOpen} onClick={() => setMenuOpen((value) => !value)} aria-expanded={menuOpen}><MoreVertical size={18} /></IconButton>
+            {menuOpen ? (
+              <div className="glass-popover absolute right-0 top-11 z-50 w-52 rounded-2xl p-1.5" role="menu">
+                <MenuItem icon={Pin} label={conversation.pinned ? "Unpin chat" : "Pin chat"} onClick={() => { setMenuOpen(false); onPin(conversation); }} />
+                <MenuItem icon={BellOff} label={conversation.muted ? "Unmute notifications" : "Mute notifications"} onClick={() => { setMenuOpen(false); onMute(conversation); }} />
+                <MenuItem icon={archivedMode ? ArchiveRestore : Archive} label={archivedMode ? "Unarchive chat" : "Archive chat"} onClick={() => { setMenuOpen(false); onArchive(conversation); }} />
+              </div>
+            ) : null}
+          </div>
         </div>
       </header>
+
+      {searchOpen ? (
+        <div className="z-10 flex shrink-0 items-center gap-2 border-b border-white/[0.06] bg-[#101b21] px-3 py-2 sm:px-4">
+          <Search size={16} className="text-[#7f929b]" />
+          <input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search messages" aria-label="Search messages" className="min-w-0 flex-1 bg-transparent text-xs text-white outline-none placeholder:text-[#71848c]" />
+          <span className="text-[10px] text-white/35">{searchQuery ? `${visibleMessages.length} found` : ""}</span>
+          <IconButton label="Close search" onClick={() => { setSearchOpen(false); setSearchQuery(""); }} className="h-8 w-8"><X size={15} /></IconButton>
+        </div>
+      ) : null}
 
       <div className="chat-wallpaper soft-scrollbar min-h-0 flex-1 overflow-y-auto" aria-live="polite">
         {loading ? <MessageSkeleton /> : messageError ? (
@@ -697,11 +911,26 @@ function ChatPane({
           <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col justify-end gap-2.5 px-3 py-5 sm:px-6">
             <div className="mx-auto mb-2 flex max-w-md items-start gap-2 rounded-xl border border-amber-200/10 bg-[#18262d]/90 px-3 py-2 text-center text-[9px] leading-relaxed text-amber-100/60 shadow-sm">
               <LockKeyhole size={12} className="mt-0.5 shrink-0 text-amber-200/60" />
-              Messages and calls are protected with end-to-end encryption. Only people in this chat can read or share them.
+              Messages use authenticated transport protection. End-to-end message encryption is not enabled yet.
             </div>
-            <div className="mx-auto my-2 rounded-full bg-[#1b2a31]/90 px-3 py-1 text-[9px] font-bold uppercase tracking-[0.12em] text-[#80939c] shadow">Today</div>
+            <div className="mx-auto my-2 rounded-full bg-[#1b2a31]/90 px-3 py-1 text-[9px] font-bold uppercase tracking-[0.12em] text-[#80939c] shadow">
+              {formatMessageDate(visibleMessages[0]?.createdAt)}
+            </div>
             {!messages.length ? <p className="mx-auto my-auto max-w-xs py-10 text-center text-xs leading-relaxed text-white/35">No messages yet. Say hello and start the conversation.</p> : null}
-            {messages.map((message) => <MessageBubble key={message.id} message={message} />)}
+            {messages.length && !visibleMessages.length ? <p className="mx-auto my-auto max-w-xs py-10 text-center text-xs leading-relaxed text-white/35">No messages match this search.</p> : null}
+            {visibleMessages.map((message) => (
+              <MessageBubble
+                key={messageKey(message)}
+                message={message}
+                starred={starredMessageIds.has(messageKey(message))}
+                onReply={() => setReplyTo(message)}
+                onStar={onStarMessage}
+                onEdit={onEditMessage}
+                onDelete={message.direction === "outgoing" ? onDeleteMessage : undefined}
+                onCopy={onCopyMessage}
+                onRetry={message.status === "failed" ? onRetryMessage : undefined}
+              />
+            ))}
             {conversation.typing ? (
               <div className="flex justify-start">
                 <div className="message-in flex items-center gap-1 bg-[#1d2b32] px-4 py-3">
@@ -719,62 +948,214 @@ function ChatPane({
         sending={sending}
         uploading={uploading}
         sendError={sendError}
+        replyTo={replyTo}
+        onCancelReply={() => setReplyTo(null)}
       />
     </section>
   );
 }
 
-function DetailRow({ icon: Icon, label, value, tone = "" }) {
+function DetailRow({ icon: Icon, label, value, tone = "", onClick, disabled = false }) {
   return (
-    <button type="button" className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition hover:bg-white/[0.045] ${tone}`}>
+    <button type="button" onClick={onClick} disabled={disabled} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition hover:bg-white/[0.045] disabled:cursor-not-allowed disabled:opacity-45 ${tone}`}>
       <span className="grid h-9 w-9 place-items-center rounded-xl bg-white/[0.045] text-[#8da0a8]"><Icon size={17} /></span>
       <span className="min-w-0 flex-1"><span className="block text-xs font-semibold">{label}</span>{value ? <span className="mt-0.5 block truncate text-[10px] text-[#748891]">{value}</span> : null}</span>
-      <ChevronRight size={15} className="text-[#657982]" />
+      {!disabled && onClick ? <ChevronRight size={15} className="text-[#657982]" /> : null}
     </button>
   );
 }
 
-function DetailsPanel({ conversation, onClose }) {
+function DetailsPanel({
+  conversation,
+  messages,
+  starredCount,
+  onClose,
+  onMessage,
+  onStartCall,
+  onPin,
+  onArchive,
+  onMute,
+  onShowStarred,
+  onSecurityInfo,
+  archivedMode,
+}) {
   if (!conversation) return null;
-  return (
-    <aside className="hidden w-[318px] shrink-0 flex-col border-l border-white/[0.07] bg-[#101b21] 2xl:flex" aria-label="Contact details">
-      <header className="flex h-[72px] shrink-0 items-center gap-2 border-b border-white/[0.06] px-4">
-        <IconButton label="Close contact details" onClick={onClose}><X size={19} /></IconButton>
-        <h2 className="text-sm font-bold">Contact info</h2>
-      </header>
-      <div className="soft-scrollbar min-h-0 flex-1 overflow-y-auto">
-        <div className="flex flex-col items-center px-5 py-7 text-center">
-          <Avatar name={conversation.name} color={conversation.color} size="xl" online={conversation.online} />
-          <h3 className="mt-4 text-lg font-extrabold">{conversation.name}</h3>
-          <p className="mt-1 text-[11px] text-[#7f929b]">{conversation.phone || "+91 98765 43210"}</p>
-          <div className="mt-5 flex gap-2">
-            <IconButton label="Message" active><MessageCircle size={18} /></IconButton>
-            <IconButton label="Voice call"><Phone size={17} /></IconButton>
-            <IconButton label="Video call"><Video size={18} /></IconButton>
-          </div>
-        </div>
-        <div className="border-y border-white/[0.06] px-5 py-4">
-          <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-[#647982]">About</p>
-          <p className="mt-2 text-xs leading-relaxed text-white/75">{conversation.about || "Available for a quick chat ✨"}</p>
-        </div>
-        <div className="border-b border-white/[0.06] px-4 py-4">
-          <div className="mb-3 flex items-center justify-between px-1"><p className="text-[10px] font-bold uppercase tracking-[0.14em] text-[#647982]">Media, links & docs</p><button type="button" className="text-[10px] font-bold text-emerald-300">24 ›</button></div>
-          <div className="grid grid-cols-3 gap-1.5">
-            {["from-[#78b2a4] to-[#173a44]", "from-[#e3ab75] to-[#664052]", "from-[#859ac9] to-[#233553]"].map((gradient, index) => <div key={gradient} className={`aspect-square rounded-lg bg-gradient-to-br ${gradient} opacity-85`} aria-label={`Shared media ${index + 1}`} />)}
-          </div>
-        </div>
-        <div className="space-y-1 px-2 py-3 text-white/75">
-          <DetailRow icon={Star} label="Starred messages" value="12 messages" />
-          <DetailRow icon={BellOff} label="Mute notifications" value="Off" />
-          <DetailRow icon={Timer} label="Disappearing messages" value="Off" />
-          <DetailRow icon={LockKeyhole} label="Encryption" value="Messages and calls are secured" />
-        </div>
-        <div className="border-t border-white/[0.06] px-2 py-3">
-          <DetailRow icon={ShieldAlert} label={`Block ${conversation.name.split(" ")[0]}`} tone="text-rose-300" />
-        </div>
-      </div>
-    </aside>
+  const sharedMedia = messages.filter((message) =>
+    ["image", "video", "file", "document"].includes(message.type) && !message.deleted,
   );
+  return (
+    <>
+      <button type="button" aria-label="Close contact details" onClick={onClose} className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm 2xl:hidden" />
+      <aside className="fixed inset-y-0 right-0 z-50 flex w-full max-w-[360px] shrink-0 flex-col border-l border-white/[0.07] bg-[#101b21] shadow-2xl 2xl:static 2xl:z-auto 2xl:w-[318px] 2xl:shadow-none" aria-label="Contact details">
+        <header className="flex h-[72px] shrink-0 items-center gap-2 border-b border-white/[0.06] px-4 pt-[env(safe-area-inset-top)]">
+          <IconButton label="Close contact details" onClick={onClose}><X size={19} /></IconButton>
+          <h2 className="text-sm font-bold">{conversation.type === "group" ? "Group info" : "Contact info"}</h2>
+        </header>
+        <div className="soft-scrollbar min-h-0 flex-1 overflow-y-auto pb-[env(safe-area-inset-bottom)]">
+          <div className="flex flex-col items-center px-5 py-7 text-center">
+            <Avatar name={conversation.name} src={conversation.profilePhoto || conversation.avatar?.image} color={conversation.color} size="xl" online={conversation.online} />
+            <h3 className="mt-4 text-lg font-extrabold">{conversation.name}</h3>
+            {conversation.phone || conversation.email ? <p className="mt-1 text-[11px] text-[#7f929b]">{conversation.phone || conversation.email}</p> : null}
+            <div className="mt-5 flex gap-2">
+              <IconButton label="Message" active onClick={onMessage}><MessageCircle size={18} /></IconButton>
+              {conversation.type !== "group" ? <IconButton label="Voice call" onClick={() => onStartCall("audio")}><Phone size={17} /></IconButton> : null}
+              {conversation.type !== "group" ? <IconButton label="Video call" onClick={() => onStartCall("video")}><Video size={18} /></IconButton> : null}
+            </div>
+          </div>
+          {conversation.about ? (
+            <div className="border-y border-white/[0.06] px-5 py-4">
+              <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-[#647982]">About</p>
+              <p className="mt-2 text-xs leading-relaxed text-white/75">{conversation.about}</p>
+            </div>
+          ) : null}
+          <div className="border-b border-white/[0.06] px-4 py-4">
+            <div className="mb-3 flex items-center justify-between px-1"><p className="text-[10px] font-bold uppercase tracking-[0.14em] text-[#647982]">Media & documents</p><span className="text-[10px] font-bold text-emerald-300">{sharedMedia.length}</span></div>
+            {sharedMedia.length ? (
+              <div className="grid grid-cols-3 gap-1.5">
+                {sharedMedia.slice(-6).map((message) => (
+                  <div key={messageKey(message)} className="grid aspect-square place-items-center rounded-lg bg-gradient-to-br from-[#25424a] to-[#13272f] text-white/50" title={message.file?.name || message.type}>
+                    {message.type === "image" ? <ImageIcon size={20} /> : message.type === "video" ? <Video size={20} /> : <Paperclip size={20} />}
+                  </div>
+                ))}
+              </div>
+            ) : <p className="rounded-xl bg-white/[0.025] px-3 py-4 text-center text-[10px] text-white/35">No shared media yet</p>}
+          </div>
+          <div className="space-y-1 px-2 py-3 text-white/75">
+            <DetailRow icon={Star} label="Starred messages" value={`${starredCount} ${starredCount === 1 ? "message" : "messages"}`} onClick={onShowStarred} />
+            <DetailRow icon={Pin} label={conversation.pinned ? "Unpin chat" : "Pin chat"} value={conversation.pinned ? "Pinned" : "Not pinned"} onClick={() => onPin(conversation)} />
+            <DetailRow icon={BellOff} label="Mute notifications" value={conversation.muted ? "On for this browser" : "Off"} onClick={() => onMute(conversation)} />
+            <DetailRow icon={archivedMode ? ArchiveRestore : Archive} label={archivedMode ? "Unarchive chat" : "Archive chat"} value={archivedMode ? "Move back to your inbox" : "Move out of your inbox"} onClick={() => onArchive(conversation)} />
+            <DetailRow icon={Timer} label="Disappearing messages" value="Not supported by the server" disabled />
+            <DetailRow icon={LockKeyhole} label="Privacy & security" value="Authenticated transport protection" onClick={onSecurityInfo} />
+          </div>
+          <div className="border-t border-white/[0.06] px-2 py-3">
+            <DetailRow icon={ShieldAlert} label={`Block ${conversation.name.split(" ")[0]}`} value="Not supported by the server" tone="text-rose-300" disabled />
+          </div>
+        </div>
+      </aside>
+    </>
+  );
+}
+
+function FeatureView({ section, conversations, onOpenChat, onStartCall, nav, onNavChange }) {
+  const groups = conversations.filter((conversation) => conversation.type === "group" || conversation.isGroup);
+  const people = conversations.filter((conversation) => conversation.type !== "group" && !conversation.isGroup);
+  const config = {
+    updates: {
+      title: "Updates",
+      description: "Status updates are not exposed by the connected messaging service yet.",
+      icon: CircleDashed,
+    },
+    communities: {
+      title: "Communities",
+      description: groups.length ? "Your group conversations in one place." : "No community or group conversations yet.",
+      icon: UsersRound,
+    },
+    calls: {
+      title: "Calls",
+      description: "Start an encrypted WebRTC call. Call history is not stored by the server.",
+      icon: Phone,
+    },
+  }[section];
+  const Icon = config.icon;
+
+  return (
+    <section className="flex min-w-0 flex-1 flex-col bg-[#0c171d]" aria-label={config.title}>
+      <header className="flex h-[72px] shrink-0 items-center gap-3 border-b border-white/[0.06] bg-[#101b21] px-5 pt-[env(safe-area-inset-top)]">
+        <span className="md:hidden"><Logo /></span>
+        <div>
+          <h1 className="text-xl font-extrabold tracking-tight">{config.title}</h1>
+          <p className="mt-0.5 text-[10px] text-white/40">{config.description}</p>
+        </div>
+      </header>
+      <div className="soft-scrollbar min-h-0 flex-1 overflow-y-auto p-4 sm:p-8">
+        {section === "updates" ? (
+          <div className="mx-auto mt-10 max-w-md rounded-3xl border border-white/[0.07] bg-[#132128] p-8 text-center">
+            <span className="mx-auto grid h-16 w-16 place-items-center rounded-2xl bg-emerald-400/10 text-emerald-300"><Icon size={30} /></span>
+            <h2 className="mt-5 text-lg font-extrabold">Status updates are coming later</h2>
+            <p className="mt-2 text-xs leading-relaxed text-white/45">The server has no status publishing API, so this screen stays honest instead of showing made-up updates.</p>
+          </div>
+        ) : null}
+        {section === "communities" ? (
+          <div className="mx-auto grid max-w-3xl gap-3 sm:grid-cols-2">
+            {groups.map((conversation) => (
+              <button key={conversation.id} type="button" onClick={() => onOpenChat(conversation)} className="flex items-center gap-3 rounded-2xl border border-white/[0.06] bg-[#132128] p-4 text-left transition hover:border-emerald-400/20 hover:bg-[#17272e]">
+                <Avatar name={conversation.name} src={conversation.profilePhoto || conversation.avatar?.image} color={conversation.color} size="md" />
+                <span className="min-w-0 flex-1"><span className="block truncate text-sm font-bold">{conversation.name}</span><span className="mt-1 block truncate text-[11px] text-white/40">{conversation.lastMessage}</span></span>
+                <ChevronRight size={17} className="text-white/30" />
+              </button>
+            ))}
+            {!groups.length ? <p className="col-span-full py-16 text-center text-sm text-white/35">Create or join a group in the server to see it here.</p> : null}
+          </div>
+        ) : null}
+        {section === "calls" ? (
+          <div className="mx-auto max-w-2xl space-y-2">
+            {people.map((conversation) => (
+              <div key={conversation.id} className="flex items-center gap-3 rounded-2xl border border-white/[0.06] bg-[#132128] p-3">
+                <button type="button" onClick={() => onOpenChat(conversation)} className="flex min-w-0 flex-1 items-center gap-3 text-left">
+                  <Avatar name={conversation.name} src={conversation.profilePhoto || conversation.avatar?.image} color={conversation.color} size="sm" online={conversation.online} />
+                  <span className="min-w-0"><span className="block truncate text-sm font-bold">{conversation.name}</span><span className="block truncate text-[10px] text-white/35">{conversation.online ? "online" : conversation.status || "Open chat"}</span></span>
+                </button>
+                <IconButton label={`Voice call ${conversation.name}`} onClick={() => onStartCall(conversation, "audio")}><Phone size={17} /></IconButton>
+                <IconButton label={`Video call ${conversation.name}`} onClick={() => onStartCall(conversation, "video")}><Video size={18} /></IconButton>
+              </div>
+            ))}
+            {!people.length ? <p className="py-16 text-center text-sm text-white/35">No direct conversations available for calls.</p> : null}
+          </div>
+        ) : null}
+      </div>
+      <MobileNav current={nav} onChange={onNavChange} />
+    </section>
+  );
+}
+
+function SettingsModal({ user, connectionStatus, onClose, onRefresh, onLogout }) {
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="fixed inset-0 z-[70] grid place-items-center bg-black/65 p-4 backdrop-blur-sm" role="presentation" onMouseDown={onClose}>
+      <section className="glass-popover w-full max-w-md rounded-3xl p-5" role="dialog" aria-modal="true" aria-labelledby="settings-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="flex items-center justify-between">
+          <div><p className="text-[10px] font-bold uppercase tracking-[0.16em] text-emerald-300">Account</p><h2 id="settings-title" className="mt-1 text-xl font-extrabold">Settings</h2></div>
+          <IconButton label="Close settings" onClick={onClose}><X size={19} /></IconButton>
+        </div>
+        <div className="mt-5 flex items-center gap-4 rounded-2xl bg-black/15 p-4">
+          <Avatar name={user?.name || user?.email || "You"} src={user?.profilePhoto} color="amber" size="lg" online />
+          <div className="min-w-0"><p className="truncate text-sm font-extrabold">{user?.name || nameFromEmail(user?.email)}</p><p className="mt-1 truncate text-[11px] text-white/40">{user?.email || "Demo account"}</p></div>
+        </div>
+        <div className="mt-4 rounded-2xl border border-white/[0.06] p-2">
+          <DetailRow icon={RefreshCw} label="Refresh conversations" value={`Connection: ${connectionStatus || "demo"}`} onClick={() => { onRefresh(); onClose(); }} />
+          <DetailRow icon={LockKeyhole} label="Message privacy" value="Authenticated transport; content E2EE is not enabled" disabled />
+        </div>
+        {externalApiEnabled ? <button type="button" onClick={onLogout} className="mt-4 flex w-full items-center justify-center gap-2 rounded-2xl bg-rose-500/12 px-4 py-3 text-xs font-bold text-rose-300 transition hover:bg-rose-500/20"><LogOut size={17} /> Log out</button> : null}
+      </section>
+    </div>
+  );
+}
+
+function StarredMessagesModal({ messages, onClose }) {
+  return (
+    <div className="fixed inset-0 z-[70] grid place-items-center bg-black/65 p-4 backdrop-blur-sm" role="presentation" onMouseDown={onClose}>
+      <section className="glass-popover flex max-h-[min(680px,90dvh)] w-full max-w-lg flex-col rounded-3xl p-4" role="dialog" aria-modal="true" aria-labelledby="starred-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="flex items-center justify-between px-1"><div><p className="text-[10px] font-bold uppercase tracking-[0.16em] text-amber-300">Saved</p><h2 id="starred-title" className="mt-1 text-xl font-extrabold">Starred messages</h2></div><IconButton label="Close starred messages" onClick={onClose}><X size={19} /></IconButton></div>
+        <div className="soft-scrollbar mt-4 min-h-0 flex-1 space-y-2 overflow-y-auto">
+          {messages.map((message) => <div key={messageKey(message)} className="rounded-2xl border border-white/[0.06] bg-black/15 p-3"><p className="text-[10px] font-bold text-emerald-300">{message.direction === "outgoing" ? "You" : message.sender || "Contact"}</p><p className="mt-1 text-xs leading-relaxed text-white/75">{message.deleted ? "This message was deleted" : message.text || message.caption || message.file?.name || "Attachment"}</p><p className="mt-2 text-[9px] text-white/30">{message.time}</p></div>)}
+          {!messages.length ? <p className="py-14 text-center text-xs text-white/35">Star a message from its menu to keep it here.</p> : null}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function Toast({ notice }) {
+  if (!notice?.text) return null;
+  return <div className={`fixed bottom-5 left-1/2 z-[80] max-w-[calc(100vw-32px)] -translate-x-1/2 rounded-full border px-4 py-2 text-center text-xs font-bold shadow-2xl backdrop-blur ${notice.tone === "error" ? "border-rose-400/20 bg-rose-950/90 text-rose-200" : "border-emerald-400/20 bg-[#15342e]/95 text-emerald-100"}`} role="status">{notice.text}</div>;
 }
 
 function NewChatModal({ conversations, onClose, onSelect, onCreate, creating }) {
@@ -904,9 +1285,9 @@ function CallOverlay({ conversation, controls }) {
       <section className="relative mx-auto flex h-full max-w-5xl flex-col overflow-hidden rounded-[32px] border border-white/[0.07] bg-gradient-to-br from-[#183039] via-[#0f1d23] to-[#081217] shadow-2xl" role="dialog" aria-modal="true" aria-label={`${isVideo ? "Video" : "Voice"} call with ${conversation.name}`}>
         <div className="absolute inset-0 opacity-30 [background-image:radial-gradient(circle_at_50%_20%,rgba(33,202,151,.36),transparent_35%)]" />
         {isVideo && remoteStream ? <video ref={remoteVideoRef} autoPlay playsInline className="absolute inset-0 h-full w-full object-cover" aria-label="Remote video" /> : null}
-        <header className="relative z-10 flex items-center justify-between p-5"><div className="flex items-center gap-2 rounded-full bg-black/20 px-3 py-2 text-xs text-white/65 backdrop-blur"><LockKeyhole size={14} /> End-to-end encrypted</div><IconButton label="Close call" onClick={close} className="bg-black/20 backdrop-blur"><X size={20} /></IconButton></header>
+        <header className="relative z-10 flex items-center justify-between p-5"><div className="flex items-center gap-2 rounded-full bg-black/20 px-3 py-2 text-xs text-white/65 backdrop-blur"><LockKeyhole size={14} /> Encrypted WebRTC media</div><IconButton label="Close call" onClick={close} className="bg-black/20 backdrop-blur"><X size={20} /></IconButton></header>
         <div className="relative z-10 flex flex-1 flex-col items-center justify-center text-center">
-          {isVideo && localStream && !remoteStream ? <video ref={localVideoRef} autoPlay muted playsInline className="mb-2 h-52 w-36 rounded-[26px] border border-white/10 object-cover shadow-2xl sm:h-64 sm:w-48" aria-label="Your video" /> : <Avatar name={conversation.name} color={conversation.color} size="xl" online={isActive} />}
+          {isVideo && localStream && !remoteStream ? <video ref={localVideoRef} autoPlay muted playsInline className="mb-2 h-52 w-36 rounded-[26px] border border-white/10 object-cover shadow-2xl sm:h-64 sm:w-48" aria-label="Your video" /> : <Avatar name={conversation.name} src={conversation.profilePhoto || conversation.avatar?.image} color={conversation.color} size="xl" online={isActive} />}
           <h2 className="mt-5 text-2xl font-extrabold">{conversation.name}</h2>
           <p className={`mt-2 text-sm ${status === "error" ? "text-rose-300" : "text-emerald-300"}`}>{statusLabel}</p>
           <p className="mt-2 max-w-sm px-6 text-xs leading-relaxed text-white/35">{call?.demo ? "Demo call preview — connect the Spring API for live peer-to-peer calls." : "WebRTC media · authenticated WebSocket signaling"}</p>
@@ -948,24 +1329,53 @@ export default function MessengerApp() {
   const [chatError, setChatError] = useState("");
   const [messageError, setMessageError] = useState("");
   const [sendError, setSendError] = useState("");
-  const [detailsOpen, setDetailsOpen] = useState(true);
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const [mobileThread, setMobileThread] = useState(false);
   const [newChatOpen, setNewChatOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [starredOpen, setStarredOpen] = useState(false);
+  const [archivedMode, setArchivedMode] = useState(false);
+  const [starredMessages, setStarredMessages] = useState(() => readStoredObject(STARRED_MESSAGES_KEY));
+  const [notice, setNotice] = useState(null);
   const [sending, setSending] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [creatingChat, setCreatingChat] = useState(false);
   const [nav, setNav] = useState("chats");
+  const selectedIdRef = useRef(null);
   const callControls = useCall({ token: externalApiEnabled ? accessToken : "" });
+  const starredMessageIds = useMemo(
+    () => new Set(Object.entries(starredMessages).filter(([, value]) => value).map(([key]) => key)),
+    [starredMessages],
+  );
 
-  const loadConversations = useCallback(async ({ silent = false, signal } = {}) => {
+  useEffect(() => {
+    selectedIdRef.current = selected?.id ?? null;
+  }, [selected?.id]);
+
+  useEffect(() => {
+    if (!notice) return undefined;
+    const timer = window.setTimeout(() => setNotice(null), 3200);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  const showNotice = useCallback((text, tone = "success") => {
+    setNotice({ text, tone, id: Date.now() });
+  }, []);
+
+  const loadConversations = useCallback(async ({ silent = false, signal, archived = false } = {}) => {
     if (!silent) {
       setLoadingChats(true);
       setChatError("");
     }
     try {
-      const result = await getConversations({ signal });
+      const result = await getConversations({ archived, signal });
       const items = unwrapList(result, "conversations");
-      const normalized = items.map(normalizeConversation);
+      const preferences = readStoredObject(CHAT_PREFERENCES_KEY);
+      const normalized = sortConversations(items.map((item, index) => {
+        const conversation = normalizeConversation(item, index);
+        const preference = preferences[String(conversation.id)];
+        return preference ? { ...conversation, muted: Boolean(preference.muted) } : conversation;
+      }));
       setConversations((current) => normalized.map((conversation) => {
         const previous = current.find((item) => String(item.id) === String(conversation.id));
         return previous ? { ...previous, ...conversation } : conversation;
@@ -975,13 +1385,13 @@ export default function MessengerApp() {
           const refreshed = normalized.find((item) => String(item.id) === String(current.id));
           return refreshed ? { ...current, ...refreshed } : current;
         }
-        return normalized[0] || (externalApiEnabled ? null : fallbackConversation);
+        return normalized[0] || (!externalApiEnabled && !archived ? fallbackConversation : null);
       });
     } catch (requestError) {
       if (requestError?.name === "AbortError") return;
       if (!silent) {
         setChatError(requestError.message || "Unable to load conversations");
-        if (!externalApiEnabled) setSelected((current) => current || fallbackConversation);
+        if (!externalApiEnabled && !archived) setSelected((current) => current || fallbackConversation);
       }
     } finally {
       if (!signal?.aborted && !silent) setLoadingChats(false);
@@ -1065,13 +1475,13 @@ export default function MessengerApp() {
             setSendError(requestError.message || "Your profile could not be loaded.");
           }
         });
-      void loadConversations({ signal: controller.signal });
+      void loadConversations({ archived: archivedMode, signal: controller.signal });
     }, 0);
     return () => {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [authenticated, loadConversations]);
+  }, [archivedMode, authenticated, loadConversations]);
 
   useEffect(() => {
     if (!selected?.id) return undefined;
@@ -1097,12 +1507,22 @@ export default function MessengerApp() {
     }, currentUser?.id);
     const selectedNow = String(selected?.id) === String(conversationId);
     const outgoing = normalized.direction === "outgoing";
+    const mutation = event.type === "MESSAGE_UPDATED" || event.type === "MESSAGE_DELETED";
 
     if (selectedNow) {
-      setMessages((items) => upsertMessage(items, normalized));
+      setMessages((items) => {
+        if (!mutation) return upsertMessage(items, normalized);
+        return items.map((message) =>
+          messageKey(message) === messageKey(normalized)
+            ? mergeMessageMutation(message, normalized)
+            : message,
+        );
+      });
     }
 
-    const preview = normalized.type === "text"
+    const preview = normalized.deleted
+      ? "This message was deleted"
+      : normalized.type === "text"
       ? normalized.text
       : normalized.type === "audio" || normalized.type === "voice"
         ? "Voice message"
@@ -1112,24 +1532,41 @@ export default function MessengerApp() {
             ? "Video"
             : "Attachment";
     const conversationExists = conversations.some((item) => String(item.id) === String(conversationId));
-    setConversations((items) => items.map((item) =>
-      String(item.id) === String(conversationId)
+    setConversations((items) => items.map((item) => {
+      const isConversation = String(item.id) === String(conversationId);
+      const isLatestMessage = String(item.lastMessageId) === String(normalized.id);
+      const isLatestMutation = mutation && isLatestMessage;
+      const staleMutation =
+        isLatestMessage &&
+        ((item.lastMessageDeleted && !normalized.deleted) ||
+          (Number(item.lastMessageRevision || 0) > 0 &&
+            Number(normalized.revision || 0) > 0 &&
+            Number(normalized.revision) < Number(item.lastMessageRevision)));
+      if (staleMutation) return item;
+      return isConversation && (!mutation || isLatestMutation)
         ? {
             ...item,
             lastMessage: preview,
-            lastMessageAt: formatTimestamp(normalized.createdAt || event.occurredAt, { list: true }),
+            lastMessageId: mutation ? item.lastMessageId : normalized.id,
+            lastMessageDeleted: normalized.deleted,
+            lastMessageRevision: normalized.revision,
+            lastMessageAt: mutation
+              ? item.lastMessageAt
+              : formatTimestamp(normalized.createdAt || event.occurredAt, { list: true }),
             mine: outgoing,
-            unread: !outgoing && !selectedNow ? Number(item.unread || 0) + 1 : 0,
+            unread: mutation
+              ? item.unread
+              : !outgoing && !selectedNow ? Number(item.unread || 0) + 1 : 0,
           }
-        : item,
-    ));
-    if (!conversationExists) void loadConversations({ silent: true });
+        : item;
+    }));
+    if (!conversationExists) void loadConversations({ archived: archivedMode, silent: true });
 
-    if (!outgoing && Number(normalized.id) > 0) {
+    if (!mutation && !outgoing && Number(normalized.id) > 0) {
       const acknowledge = selectedNow ? markMessagesRead : markMessagesDelivered;
       void acknowledge(conversationId, normalized.id).catch(() => {});
     }
-  }, [conversations, currentUser?.id, loadConversations, selected?.id]);
+  }, [archivedMode, conversations, currentUser?.id, loadConversations, selected?.id]);
 
   const handleRealtimeReceipt = useCallback((event) => {
     const payload = event.payload || {};
@@ -1150,8 +1587,8 @@ export default function MessengerApp() {
   }, [currentUser, selected]);
 
   const handleRealtimeConversation = useCallback(() => {
-    void loadConversations({ silent: true });
-  }, [loadConversations]);
+    void loadConversations({ archived: archivedMode, silent: true });
+  }, [archivedMode, loadConversations]);
 
   const realtime = useRealtimeChat({
     token: externalApiEnabled ? accessToken : "",
@@ -1164,11 +1601,11 @@ export default function MessengerApp() {
   useEffect(() => {
     if (!authenticated || !externalApiEnabled || realtime.isConnected) return undefined;
     const timer = window.setInterval(() => {
-      void loadConversations({ silent: true });
+      void loadConversations({ archived: archivedMode, silent: true });
       if (selected?.id) void loadMessagesFor(selected, { silent: true });
     }, 10_000);
     return () => window.clearInterval(timer);
-  }, [authenticated, loadConversations, loadMessagesFor, realtime.isConnected, selected]);
+  }, [archivedMode, authenticated, loadConversations, loadMessagesFor, realtime.isConnected, selected]);
 
   const selectConversation = (conversation) => {
     setLoadingMessages(true);
@@ -1177,16 +1614,19 @@ export default function MessengerApp() {
     setMessages([]);
     setSelected(conversation);
     setMobileThread(true);
+    setDetailsOpen(false);
+    setNav("chats");
     setConversations((items) => items.map((item) => String(item.id) === String(conversation.id) ? { ...item, unread: 0 } : item));
   };
 
-  const handleSend = async ({ text }) => {
+  const handleSend = async ({ text, replyTo = null }) => {
     if (!selected) return;
+    const conversationId = selected.id;
     const clientMessageId = globalThis.crypto?.randomUUID?.() || `web-${Date.now()}`;
     const optimistic = {
       id: `temp-${clientMessageId}`,
       clientMessageId,
-      conversationId: selected.id,
+      conversationId,
       sender: "me",
       senderUserId: currentUser?.id,
       direction: "outgoing",
@@ -1195,14 +1635,25 @@ export default function MessengerApp() {
       createdAt: new Date().toISOString(),
       time: formatTimestamp(new Date()),
       status: "sending",
+      replyTo: replyTo ? {
+        id: replyTo.id,
+        sender: replyTo.direction === "outgoing" ? "You" : replyTo.sender,
+        text: replyTo.deleted ? "This message was deleted" : replyTo.text || replyTo.caption || "Attachment",
+      } : null,
     };
     setMessages((items) => upsertMessage(items, optimistic));
     setSendError("");
     setSending(true);
     try {
-      const result = await sendMessage(selected.id, { text, type: "text", clientMessageId });
+      const result = await sendMessage(conversationId, {
+        text,
+        type: "text",
+        clientMessageId,
+        parentMessageId: replyTo?.id ?? null,
+        replyTo: optimistic.replyTo,
+      });
       const saved = result?.message || result;
-      if (saved?.id) {
+      if (saved?.id && String(selectedIdRef.current) === String(conversationId)) {
         const normalized = normalizeMessage(saved, currentUser?.id);
         setMessages((items) => upsertMessage(items, {
           ...optimistic,
@@ -1210,9 +1661,11 @@ export default function MessengerApp() {
           direction: "outgoing",
         }, optimistic.id));
       }
-      setConversations((items) => items.map((item) => String(item.id) === String(selected.id) ? { ...item, lastMessage: text, lastMessageAt: "now", mine: true } : item));
+      setConversations((items) => items.map((item) => String(item.id) === String(conversationId) ? { ...item, lastMessage: text, lastMessageAt: "now", mine: true } : item));
     } catch (requestError) {
-      setMessages((items) => items.map((item) => item.id === optimistic.id ? { ...item, status: "failed" } : item));
+      if (String(selectedIdRef.current) === String(conversationId)) {
+        setMessages((items) => items.map((item) => item.id === optimistic.id ? { ...item, status: "failed" } : item));
+      }
       setSendError(requestError.message || "Message not sent.");
       throw requestError;
     } finally {
@@ -1222,6 +1675,7 @@ export default function MessengerApp() {
 
   const handleUpload = async (file, metadata = {}) => {
     if (!selected) return;
+    const conversationId = selected.id;
     const type = metadata.type || mediaTypeFromFile(file);
     if (!type) throw new Error("Choose an image, video, or audio file.");
     const clientMessageId = globalThis.crypto?.randomUUID?.() || `web-${Date.now()}`;
@@ -1232,7 +1686,7 @@ export default function MessengerApp() {
     const optimistic = {
       id: `temp-${clientMessageId}`,
       clientMessageId,
-      conversationId: selected.id,
+      conversationId,
       sender: "me",
       senderUserId: currentUser?.id,
       direction: "outgoing",
@@ -1249,7 +1703,7 @@ export default function MessengerApp() {
     setSendError("");
     setUploading(true);
     try {
-      const uploaded = await uploadMedia(selected.id, file);
+      const uploaded = await uploadMedia(conversationId, file);
       const mediaUrl = uploaded.url || uploaded.path || uploaded.downloadUrl;
       if (!mediaUrl) throw new Error("The server did not return a media URL.");
       const uploadedType = String(uploaded.messageType || type).toLowerCase();
@@ -1258,7 +1712,7 @@ export default function MessengerApp() {
         contentType: uploaded.contentType || file.type,
         alt: uploaded.originalFilename || uploaded.fileName || file.name,
       };
-      const result = await sendMessage(selected.id, {
+      const result = await sendMessage(conversationId, {
         clientMessageId,
         type: uploadedType,
         content: mediaUrl,
@@ -1267,24 +1721,198 @@ export default function MessengerApp() {
       });
       const saved = result?.message || result;
       const normalized = normalizeMessage(saved, currentUser?.id);
-      setMessages((items) => upsertMessage(items, {
-        ...optimistic,
-        ...normalized,
-        direction: "outgoing",
-        type: uploadedType,
-        duration,
-        media: uploadedMedia,
-      }, optimistic.id));
+      if (String(selectedIdRef.current) === String(conversationId)) {
+        setMessages((items) => upsertMessage(items, {
+          ...optimistic,
+          ...normalized,
+          direction: "outgoing",
+          type: uploadedType,
+          duration,
+          media: uploadedMedia,
+        }, optimistic.id));
+      }
       URL.revokeObjectURL(localUrl);
       const preview = uploadedType === "audio" ? "Voice message" : uploadedType === "image" ? "Photo" : "Video";
-      setConversations((items) => items.map((item) => String(item.id) === String(selected.id) ? { ...item, lastMessage: preview, lastMessageAt: "now", mine: true } : item));
+      setConversations((items) => items.map((item) => String(item.id) === String(conversationId) ? { ...item, lastMessage: preview, lastMessageAt: "now", mine: true } : item));
     } catch (requestError) {
-      setMessages((items) => items.map((item) => item.id === optimistic.id ? { ...item, status: "failed" } : item));
+      if (String(selectedIdRef.current) === String(conversationId)) {
+        setMessages((items) => items.map((item) => item.id === optimistic.id ? { ...item, status: "failed" } : item));
+      }
       setSendError(requestError.message || "Attachment not sent.");
       throw requestError;
     } finally {
       setUploading(false);
     }
+  };
+
+  const handleEditMessage = async (message, text) => {
+    const conversationId = message.conversationId ?? selected?.id;
+    if (!conversationId || !message.id || String(message.id).startsWith("temp-")) {
+      throw new Error("Wait for this message to finish sending before editing it.");
+    }
+    const result = await editMessageRequest(conversationId, message.id, text);
+    const saved = normalizeMessage(result?.message || result, currentUser?.id);
+    const updatedConversation = result?.conversation
+      ? normalizeConversation(result.conversation)
+      : null;
+    if (String(selectedIdRef.current) === String(conversationId)) {
+      setMessages((items) => items.map((item) =>
+        messageKey(item) === messageKey(message)
+          ? { ...item, ...saved, text, edited: true, direction: "outgoing" }
+          : item,
+      ));
+    }
+    setConversations((items) => items.map((item) =>
+      String(item.id) === String(conversationId) && updatedConversation
+        ? { ...item, ...updatedConversation }
+        : String(item.id) === String(conversationId) && item.lastMessage === message.text
+        ? {
+            ...item,
+            lastMessage: text,
+            lastMessageDeleted: false,
+            lastMessageRevision: saved.revision,
+          }
+        : item,
+    ));
+    showNotice("Message edited");
+  };
+
+  const handleDeleteMessage = async (message) => {
+    const conversationId = message.conversationId ?? selected?.id;
+    if (!conversationId || !message.id || String(message.id).startsWith("temp-")) {
+      throw new Error("Wait for this message to finish sending before deleting it.");
+    }
+    const result = await deleteMessageRequest(conversationId, message.id);
+    const saved = normalizeMessage(result?.message || result, currentUser?.id);
+    const updatedConversation = result?.conversation
+      ? normalizeConversation(result.conversation)
+      : null;
+    const tombstone = {
+      ...message,
+      ...saved,
+      text: "",
+      caption: "",
+      media: null,
+      file: null,
+      reactions: [],
+      deleted: true,
+      deletedAt: saved.deletedAt || new Date().toISOString(),
+    };
+    if (String(selectedIdRef.current) === String(conversationId)) {
+      setMessages((items) => items.map((item) =>
+        messageKey(item) === messageKey(message) ? tombstone : item,
+      ));
+    }
+    setConversations((items) => items.map((item) =>
+      String(item.id) === String(conversationId) && updatedConversation
+        ? { ...item, ...updatedConversation }
+        : String(item.id) === String(conversationId) && item.lastMessage === message.text
+        ? {
+            ...item,
+            lastMessage: "You deleted this message",
+            lastMessageDeleted: true,
+            lastMessageRevision: saved.revision,
+          }
+        : item,
+    ));
+    setStarredMessages((current) => {
+      const next = { ...current };
+      delete next[messageKey(message)];
+      storeObject(STARRED_MESSAGES_KEY, next);
+      return next;
+    });
+    showNotice("Message deleted");
+  };
+
+  const handleStarMessage = (message, nextValue) => {
+    setStarredMessages((current) => {
+      const next = { ...current, [messageKey(message)]: Boolean(nextValue) };
+      if (!nextValue) delete next[messageKey(message)];
+      storeObject(STARRED_MESSAGES_KEY, next);
+      return next;
+    });
+    showNotice(nextValue ? "Message starred on this device" : "Message unstarred");
+  };
+
+  const handleCopyMessage = async (message) => {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(message.text);
+    } else {
+      const textArea = document.createElement("textarea");
+      textArea.value = message.text;
+      textArea.style.position = "fixed";
+      textArea.style.opacity = "0";
+      document.body.appendChild(textArea);
+      textArea.select();
+      const copied = document.execCommand("copy");
+      textArea.remove();
+      if (!copied) throw new Error("Message could not be copied.");
+    }
+    showNotice("Message copied");
+  };
+
+  const handleRetryMessage = async (message) => {
+    setMessages((items) => items.filter((item) => messageKey(item) !== messageKey(message)));
+    return handleSend({ text: message.text, replyTo: message.replyTo });
+  };
+
+  const handlePinConversation = async (conversation) => {
+    const pinned = !conversation.pinned;
+    try {
+      await updateConversationFlags(conversation.id, { pinned });
+      setConversations((items) => sortConversations(items.map((item) =>
+        String(item.id) === String(conversation.id) ? { ...item, pinned } : item,
+      )));
+      setSelected((current) => String(current?.id) === String(conversation.id) ? { ...current, pinned } : current);
+      showNotice(pinned ? "Chat pinned" : "Chat unpinned");
+    } catch (requestError) {
+      showNotice(requestError.message || "Pin setting could not be changed.", "error");
+    }
+  };
+
+  const handleArchiveConversation = async (conversation) => {
+    const archived = !archivedMode;
+    try {
+      await updateConversationFlags(conversation.id, { archived });
+      setConversations((items) => items.filter((item) => String(item.id) !== String(conversation.id)));
+      if (String(selectedIdRef.current) === String(conversation.id)) {
+        setSelected(null);
+        setMessages([]);
+        setMobileThread(false);
+        setDetailsOpen(false);
+      }
+      showNotice(archived ? "Chat archived" : "Chat restored to inbox");
+    } catch (requestError) {
+      showNotice(requestError.message || "Archive setting could not be changed.", "error");
+    }
+  };
+
+  const handleMuteConversation = async (conversation) => {
+    const muted = !conversation.muted;
+    try {
+      if (!externalApiEnabled) await updateConversationFlags(conversation.id, { muted });
+      const preferences = readStoredObject(CHAT_PREFERENCES_KEY);
+      preferences[String(conversation.id)] = {
+        ...(preferences[String(conversation.id)] || {}),
+        muted,
+      };
+      storeObject(CHAT_PREFERENCES_KEY, preferences);
+      setConversations((items) => items.map((item) =>
+        String(item.id) === String(conversation.id) ? { ...item, muted } : item,
+      ));
+      setSelected((current) => String(current?.id) === String(conversation.id) ? { ...current, muted } : current);
+      showNotice(muted ? "Notifications muted on this device" : "Notifications unmuted");
+    } catch (requestError) {
+      showNotice(requestError.message || "Notification setting could not be changed.", "error");
+    }
+  };
+
+  const toggleArchivedMode = () => {
+    setArchivedMode((value) => !value);
+    setSelected(null);
+    setMessages([]);
+    setMobileThread(false);
+    setDetailsOpen(false);
   };
 
   const handleCreateChat = async (person) => {
@@ -1307,11 +1935,11 @@ export default function MessengerApp() {
     }
   };
 
-  const startSelectedCall = async (type) => {
-    if (!selected) return;
+  const startCallForConversation = async (conversation, type) => {
+    if (!conversation || conversation.type === "group") return;
     try {
       await callControls.startCall({
-        conversationId: selected.signalConversationId || selected.id,
+        conversationId: conversation.signalConversationId || conversation.id,
         mediaType: type === "video" ? "VIDEO" : "AUDIO",
       });
     } catch {
@@ -1319,9 +1947,38 @@ export default function MessengerApp() {
     }
   };
 
+  const startSelectedCall = (type) => startCallForConversation(selected, type);
+
+  const handleNavChange = (nextNav) => {
+    setNav(nextNav);
+    setDetailsOpen(false);
+    if (nextNav !== "chats") {
+      setMobileThread(false);
+      if (archivedMode) {
+        setArchivedMode(false);
+        setSelected(null);
+        setMessages([]);
+      }
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await logout();
+      setSettingsOpen(false);
+      setConversations([]);
+      setMessages([]);
+      setSelected(null);
+      setAuthenticated(false);
+    } catch (requestError) {
+      showNotice(requestError.message || "Could not log out.", "error");
+    }
+  };
+
   const activeCallConversation = callControls.call
     ? conversations.find((item) => String(item.signalConversationId || item.id) === String(callControls.call.conversationId)) || selected || fallbackConversation
     : null;
+  const starredInConversation = messages.filter((message) => starredMessageIds.has(messageKey(message)));
 
   const handleAuthenticated = (session) => {
     const token = session?.accessToken || getAccessToken() || "";
@@ -1345,12 +2002,88 @@ export default function MessengerApp() {
 
   return (
     <div className="app-frame flex overflow-hidden rounded-[26px] border border-white/[0.08] bg-[#0b161c]">
-      <NavRail current={nav} onChange={setNav} />
-      <Sidebar conversations={conversations} selectedId={selected?.id} onSelect={selectConversation} loading={loadingChats} error={chatError} onRetry={() => loadConversations()} onNewChat={() => setNewChatOpen(true)} mobileThread={mobileThread} connectionStatus={realtime.connectionStatus} />
-      <ChatPane conversation={selected} messages={messages} loading={loadingMessages} messageError={messageError} onRetryMessages={() => loadMessagesFor(selected)} onBack={() => setMobileThread(false)} onToggleDetails={() => setDetailsOpen((value) => !value)} onStartCall={startSelectedCall} onSend={handleSend} onUpload={handleUpload} sending={sending} uploading={uploading} sendError={sendError} mobileThread={mobileThread} />
-      {detailsOpen ? <DetailsPanel conversation={selected} onClose={() => setDetailsOpen(false)} /> : null}
+      <NavRail current={nav} onChange={handleNavChange} currentUser={currentUser} onSettings={() => setSettingsOpen(true)} />
+      {nav === "chats" ? (
+        <>
+          <Sidebar
+            conversations={conversations}
+            selectedId={selected?.id}
+            onSelect={selectConversation}
+            loading={loadingChats}
+            error={chatError}
+            onRetry={() => loadConversations({ archived: archivedMode })}
+            onNewChat={() => setNewChatOpen(true)}
+            mobileThread={mobileThread}
+            connectionStatus={realtime.connectionStatus}
+            nav={nav}
+            onNavChange={handleNavChange}
+            archivedMode={archivedMode}
+            onToggleArchived={toggleArchivedMode}
+            onPin={handlePinConversation}
+            onArchive={handleArchiveConversation}
+            onMute={handleMuteConversation}
+            onSettings={() => setSettingsOpen(true)}
+            onLogout={() => void handleLogout()}
+          />
+          <ChatPane
+            key={selected?.id || "empty-chat"}
+            conversation={selected}
+            messages={messages}
+            loading={loadingMessages}
+            messageError={messageError}
+            onRetryMessages={() => loadMessagesFor(selected)}
+            onBack={() => setMobileThread(false)}
+            onToggleDetails={() => setDetailsOpen((value) => !value)}
+            onStartCall={startSelectedCall}
+            onSend={handleSend}
+            onUpload={handleUpload}
+            sending={sending}
+            uploading={uploading}
+            sendError={sendError}
+            mobileThread={mobileThread}
+            starredMessageIds={starredMessageIds}
+            onEditMessage={handleEditMessage}
+            onDeleteMessage={handleDeleteMessage}
+            onStarMessage={handleStarMessage}
+            onRetryMessage={handleRetryMessage}
+            onCopyMessage={handleCopyMessage}
+            onPin={handlePinConversation}
+            onArchive={handleArchiveConversation}
+            onMute={handleMuteConversation}
+            archivedMode={archivedMode}
+          />
+          {detailsOpen ? (
+            <DetailsPanel
+              conversation={selected}
+              messages={messages}
+              starredCount={starredInConversation.length}
+              onClose={() => setDetailsOpen(false)}
+              onMessage={() => setDetailsOpen(false)}
+              onStartCall={startSelectedCall}
+              onPin={handlePinConversation}
+              onArchive={handleArchiveConversation}
+              onMute={handleMuteConversation}
+              onShowStarred={() => setStarredOpen(true)}
+              onSecurityInfo={() => showNotice("Messages use authenticated transport. Content end-to-end encryption is not enabled yet.")}
+              archivedMode={archivedMode}
+            />
+          ) : null}
+        </>
+      ) : (
+        <FeatureView
+          section={nav}
+          conversations={conversations}
+          onOpenChat={selectConversation}
+          onStartCall={startCallForConversation}
+          nav={nav}
+          onNavChange={handleNavChange}
+        />
+      )}
       {newChatOpen ? <NewChatModal conversations={conversations} onClose={() => setNewChatOpen(false)} onSelect={(conversation) => { selectConversation(conversation); setNewChatOpen(false); }} onCreate={handleCreateChat} creating={creatingChat} /> : null}
+      {settingsOpen ? <SettingsModal user={currentUser} connectionStatus={realtime.connectionStatus} onClose={() => setSettingsOpen(false)} onRefresh={() => loadConversations({ archived: archivedMode })} onLogout={() => void handleLogout()} /> : null}
+      {starredOpen ? <StarredMessagesModal messages={starredInConversation} onClose={() => setStarredOpen(false)} /> : null}
       {callControls.call && activeCallConversation ? <CallOverlay conversation={activeCallConversation} controls={callControls} /> : null}
+      <Toast notice={notice} />
     </div>
   );
 }

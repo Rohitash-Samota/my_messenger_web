@@ -1,5 +1,8 @@
 "use client";
 
+import Image from "next/image";
+import { useState } from "react";
+
 const palettes = {
   emerald: "from-emerald-300 via-teal-400 to-cyan-600",
   violet: "from-violet-300 via-fuchsia-400 to-indigo-600",
@@ -9,11 +12,41 @@ const palettes = {
   lime: "from-lime-300 via-emerald-400 to-teal-600",
 };
 
+const imageSizes = {
+  xs: "32px",
+  sm: "40px",
+  md: "48px",
+  lg: "64px",
+  xl: "96px",
+};
+
+function ProfileImage({ name, size, source }) {
+  const [failed, setFailed] = useState(false);
+
+  if (!source || failed) return null;
+
+  return (
+    <Image
+      src={source}
+      alt=""
+      fill
+      sizes={imageSizes[size] || imageSizes.md}
+      unoptimized
+      className="object-cover"
+      onError={() => setFailed(true)}
+      aria-hidden="true"
+      title={`${name || "User"} profile photo`}
+    />
+  );
+}
+
 export default function Avatar({
   name,
   color = "emerald",
   size = "md",
   online = false,
+  src = null,
+  profilePhoto = null,
   className = "",
 }) {
   const initials = (name || "User")
@@ -31,19 +64,35 @@ export default function Avatar({
   };
   const palette = palettes[color];
   const solidColor = !palette && typeof color === "string" ? color : null;
+  const imageSource = src || profilePhoto;
 
   return (
-    <span className={`relative inline-flex shrink-0 ${className}`} aria-label={name}>
+    <span
+      className={`relative inline-flex shrink-0 ${className}`}
+      role="img"
+      aria-label={`${name || "User"} profile photo`}
+    >
       <span
-        className={`grid place-items-center rounded-full ${
+        className={`relative grid place-items-center overflow-hidden rounded-full ${
           palette ? `bg-gradient-to-br ${palette}` : ""
         } ${sizes[size] || sizes.md} font-extrabold tracking-tight text-white shadow-inner shadow-white/20`}
         style={solidColor ? { background: `linear-gradient(145deg, ${solidColor}, color-mix(in srgb, ${solidColor} 58%, #071116))` } : undefined}
       >
         {initials}
+        {imageSource ? (
+          <ProfileImage
+            key={typeof imageSource === "string" ? imageSource : imageSource?.src}
+            name={name}
+            size={size}
+            source={imageSource}
+          />
+        ) : null}
       </span>
       {online ? (
-        <span className="absolute bottom-0 right-0 h-[27%] w-[27%] rounded-full border-2 border-[#101b21] bg-[#20d69f]" />
+        <span
+          className="absolute bottom-0 right-0 h-[27%] w-[27%] rounded-full border-2 border-[#101b21] bg-[#20d69f]"
+          aria-hidden="true"
+        />
       ) : null}
     </span>
   );

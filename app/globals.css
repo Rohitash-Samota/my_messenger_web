@@ -46,8 +46,8 @@ button {
 
 .app-frame {
   width: min(1550px, calc(100vw - 32px));
-  height: min(980px, calc(100dvh - 32px));
-  min-height: 680px;
+  height: calc(100dvh - 32px);
+  max-height: 980px;
   margin: 16px auto;
   box-shadow: 0 32px 90px rgba(0, 0, 0, 0.45);
 }

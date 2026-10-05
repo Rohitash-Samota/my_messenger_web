@@ -809,10 +809,13 @@ export const mockMessages = {
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
-export function listConversations({ query = "" } = {}) {
+export function listConversations({ query = "", archived = false } = {}) {
   const search = query.trim().toLocaleLowerCase();
+  const visibleConversations = mockConversations.filter(
+    (conversation) => Boolean(conversation.archived) === Boolean(archived),
+  );
   const conversations = search
-    ? mockConversations.filter((conversation) => {
+    ? visibleConversations.filter((conversation) => {
         const searchable = [
           conversation.name,
           conversation.lastMessage,
@@ -825,7 +828,7 @@ export function listConversations({ query = "" } = {}) {
 
         return searchable.includes(search);
       })
-    : mockConversations;
+    : visibleConversations;
 
   return clone(
     [...conversations].sort((first, second) => {
@@ -846,6 +849,7 @@ export function listMessages(conversationId) {
 }
 
 const previewForMessage = (message) => {
+  if (message.deleted) return "You deleted this message";
   if (message.type === "image") return message.text || "Photo";
   if (message.type === "video") return message.text || "Video";
   if (message.type === "audio") return "Voice message";
@@ -857,9 +861,17 @@ export function appendMessage(conversationId, input) {
   const conversation = mockConversations.find(({ id }) => id === conversationId);
   if (!conversation || !Object.hasOwn(mockMessages, conversationId)) return null;
 
+  if (input.clientMessageId) {
+    const existing = mockMessages[conversationId].find(
+      (message) => message.clientMessageId === input.clientMessageId,
+    );
+    if (existing) return clone(existing);
+  }
+
   const timestamp = new Date().toISOString();
   const message = {
     id: globalThis.crypto?.randomUUID?.() || `message-${Date.now()}`,
+    clientMessageId: input.clientMessageId || null,
     conversationId,
     sender: currentUser.name,
     direction: "outgoing",
@@ -867,6 +879,7 @@ export function appendMessage(conversationId, input) {
     text: input.text || "",
     time: timestamp,
     status: "sent",
+    revision: 0,
     replyTo: input.replyTo || null,
     reactions: [],
     media: input.media || null,
@@ -875,9 +888,81 @@ export function appendMessage(conversationId, input) {
   };
 
   mockMessages[conversationId].push(message);
+  conversation.lastMessageId = message.id;
   conversation.lastMessage = previewForMessage(message);
   conversation.lastMessageAt = timestamp;
   conversation.unread = 0;
 
   return clone(message);
+}
+
+const editableConversationFlags = new Set(["pinned", "archived", "muted"]);
+
+export function updateConversationFlags(conversationId, updates) {
+  const conversation = mockConversations.find(
+    ({ id }) => String(id) === String(conversationId),
+  );
+  if (!conversation) return null;
+
+  Object.entries(updates).forEach(([key, value]) => {
+    if (editableConversationFlags.has(key) && typeof value === "boolean") {
+      conversation[key] = value;
+    }
+  });
+  return clone(conversation);
+}
+
+function syncConversationPreview(conversationId) {
+  const conversation = mockConversations.find(
+    ({ id }) => String(id) === String(conversationId),
+  );
+  const messages = mockMessages[conversationId];
+  if (!conversation || !messages) return null;
+
+  const latest = messages.at(-1);
+  conversation.lastMessageId = latest?.id || null;
+  conversation.lastMessage = latest ? previewForMessage(latest) : "Start a conversation";
+  conversation.lastMessageAt = latest?.time || null;
+  return conversation;
+}
+
+export function editMockMessage(conversationId, messageId, text) {
+  const messages = mockMessages[conversationId];
+  if (!messages) return { error: "conversation_not_found" };
+  const message = messages.find(({ id }) => String(id) === String(messageId));
+  if (!message) return { error: "message_not_found" };
+  if (message.direction !== "outgoing") return { error: "message_not_owned" };
+  if (message.type !== "text" || message.deleted) return { error: "message_not_editable" };
+
+  message.text = text;
+  message.edited = true;
+  message.editedAt = new Date().toISOString();
+  message.revision = Number(message.revision || 0) + 1;
+  syncConversationPreview(conversationId);
+  return { message: clone(message), conversation: findConversation(conversationId) };
+}
+
+export function deleteMockMessage(conversationId, messageId) {
+  const messages = mockMessages[conversationId];
+  if (!messages) return { error: "conversation_not_found" };
+  const message = messages.find(({ id }) => String(id) === String(messageId));
+  if (!message) return { error: "message_not_found" };
+  if (message.direction !== "outgoing") return { error: "message_not_owned" };
+
+  if (!message.deleted) {
+    message.type = "text";
+    message.text = "";
+    message.caption = "";
+    message.media = null;
+    message.file = null;
+    message.duration = null;
+    message.reactions = [];
+    message.replyTo = null;
+    message.deleted = true;
+    message.deletedAt = new Date().toISOString();
+    message.revision = Number(message.revision || 0) + 1;
+    syncConversationPreview(conversationId);
+  }
+
+  return { message: clone(message), conversation: findConversation(conversationId) };
 }

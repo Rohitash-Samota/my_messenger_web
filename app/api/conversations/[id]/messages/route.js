@@ -42,13 +42,16 @@ function normalisePayload(payload) {
   }
 
   const text = typeof payload.text === "string" ? payload.text.trim() : "";
-  if (text.length > 5000) {
-    return { error: "Message text cannot exceed 5,000 characters." };
+  if (text.length > 1000) {
+    return { error: "Message text cannot exceed 1,000 characters." };
   }
 
   const media = isObject(payload.media) ? payload.media : null;
   const file = isObject(payload.file) ? payload.file : null;
   const duration = Number.isFinite(payload.duration) && payload.duration >= 0 ? payload.duration : null;
+  const clientMessageId = typeof payload.clientMessageId === "string"
+    ? payload.clientMessageId.trim().slice(0, 64)
+    : null;
 
   if (type === "text" && !text) {
     return { error: "Message text is required." };
@@ -87,6 +90,7 @@ function normalisePayload(payload) {
       media,
       file,
       duration,
+      clientMessageId,
     },
   };
 }

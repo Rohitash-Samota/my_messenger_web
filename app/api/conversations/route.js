@@ -11,7 +11,20 @@ const noStoreHeaders = {
 export async function GET(request) {
   try {
     const query = request.nextUrl.searchParams.get("q")?.slice(0, 100) || "";
-    const conversations = listConversations({ query });
+    const archivedValue = request.nextUrl.searchParams.get("archived");
+    if (archivedValue !== null && !["true", "false"].includes(archivedValue)) {
+      return NextResponse.json(
+        {
+          error: {
+            code: "invalid_archived_filter",
+            message: "The archived filter must be true or false.",
+          },
+        },
+        { status: 422, headers: noStoreHeaders },
+      );
+    }
+    const archived = archivedValue === "true";
+    const conversations = listConversations({ query, archived });
 
     return NextResponse.json(
       {
@@ -19,6 +32,7 @@ export async function GET(request) {
         meta: {
           total: conversations.length,
           query: query || null,
+          archived,
           currentUser,
         },
       },

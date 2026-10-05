@@ -34,8 +34,10 @@ Open [http://localhost:3000](http://localhost:3000) in your browser. Registering
 To use the built-in demo instead, clear both public environment values in `.env.local`. Demo mode skips account authentication and uses these Next.js endpoints:
 
 - `GET /api/conversations` returns the conversation list.
+- `PATCH /api/conversations/:id` pins, archives, or mutes a demo conversation.
 - `GET /api/conversations/:id/messages` returns a conversation and its message history.
 - `POST /api/conversations/:id/messages` creates a new message in that conversation.
+- `PATCH|DELETE /api/conversations/:id/messages/:messageId` edits or soft-deletes a sent message.
 
 The demo data is intended for local UI development and is not a persistent production datastore.
 
@@ -53,10 +55,14 @@ The external mode uses:
 - `POST /api/auth/login`, `/register`, `/refresh`, and `/logout`
 - `GET /api/auth/me`
 - `GET /v1/api/conversions`
+- `PATCH /v1/api/conversions/:id/pin` and `/archive`
 - `GET|POST /v1/api/messages/:conversionId`
+- `PATCH|DELETE /v1/api/messages/:conversionId/:messageId`
 - STOMP endpoint `/ws`, publish destination `/app/calls.signal`
 - User subscriptions `/user/queue/calls` and `/user/queue/errors`
 
 The access token is supplied in the STOMP `CONNECT` headers. Call media travels peer-to-peer with WebRTC; the backend relays only invite, SDP, and ICE signaling. Production calling requires HTTPS/WSS plus a TURN service for restrictive networks.
 
 If both public environment values are blank, Wavely stays in demo mode with local data and a call preview.
+
+Message starring and notification muting are saved in the current browser because the Spring service does not expose those preferences yet. Status updates, disappearing messages, blocking, and server-side call history are shown as unavailable instead of being simulated.
